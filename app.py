@@ -12,6 +12,7 @@ LOG_PATH = BASE / "bet_log.csv"
 BR_PATH = BASE / "bankrolls.json"
 CACHES = [BASE / "markets_cache_11.json", BASE / "markets_cache_14.json"]
 DEFAULT_BR = {"FanDuel": 25.00, "DraftKings": 19.92, "Kalshi": 10.00, "Polymarket": 0.00}
+BOOK_MAP = {"fanduel": "FanDuel", "draftkings": "DraftKings", "kalshi": "Kalshi", "polymarket": "Polymarket"}
 
 def get_key():
     try:
@@ -38,6 +39,11 @@ def imp_prob(odds: float) -> float:
     if odds == 0: return 0.0
     return 100.0 / (odds + 100.0) if odds > 0 else abs(odds) / (abs(odds) + 100.0)
 
+def dec_to_am(dec: float) -> int:
+    if dec <= 1.0: return -100
+    if dec >= 2.0: return int(round((dec - 1.0) * 100))
+    return int(round(-100.0 / (dec - 1.0)))
+
 def payout_delta(stake: float, odds: float, result: str) -> float:
     dec = (1.0 + odds / 100.0) if odds > 0 else (1.0 + 100.0 / abs(odds)) if odds < 0 else 1.0
     if result == "WIN": return round(stake * (dec - 1.0), 2)
@@ -62,35 +68,65 @@ def pick_team(f, keys):
 def parse_fixtures(payload):
     items = payload if isinstance(payload, list) else payload.get("fixtures") or payload.get("data") or payload.get("items") or []
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    upcoming = []
-    all_parsed = []
+    upcoming, all_parsed = [], []
     for idx, f in enumerate(items):
         if not isinstance(f, dict): continue
-        fid = f.get("fixtureId") or f.get("id") or f"game_{idx+1}"
-        away = pick_team(f, ["awayTeamName", "away", "participant2Name", "opponentName"]) or "Away"
-        home = pick_team(f, ["homeTeamName", "home", "participant1Name", "teamName"]) or "Home"
-        start = str(f.get("startTime") or f.get("commenceTime") or f.get("date") or "")
-        books = f.get("bookmakers") or f.get("odds") or {}
-        b_count = len(books) if isinstance(books, (list, dict)) else 0
-        rec = {"id": str(fid), "Matchup": f"{away} @ {home}", "Start": start[:16], "Books": b_count}
+        fid = str(f.get("fixtureId") or f.get("id") or f"game_{idx+1}")
+        away = pick_team(f, ["awayTeamName", "participant2Name", "away", "opponentName"]) or "Away"
+        home = pick_team(f, ["homeTeamName", "participant1Name", "home", "teamName"]) or "Home"
+        start = str(f.get("startTime") or f.get("commenceTime") or f.get("date") or "")[:16]
+        has_odds = bool(f.get("hasOdds", False))
+        rec = {"fixtureId": fid, "Matchup": f"{away} @ {home}", "Start": start, "HasOdds": has_odds, "Label": f"{away} @ {home} ({start})"}
         all_parsed.append(rec)
         if start[:10] >= now_iso:
             upcoming.append(rec)
     chosen = upcoming if upcoming else all_parsed
-    return chosen[:25], len(upcoming), len(all_parsed)
+    return chosen[:30], len(upcoming), len(all_parsed)
 
-if "br_state" not in st.session_state:
-    st.session_state.br_state = load_saved_br()
-if "sizer_mkt" not in st.session_state:
-    st.session_state.sizer_mkt = "NBA Cup Prop"
-if "sizer_odds" not in st.session_state:
-    st.session_state.sizer_odds = -220
-if "sizer_app" not in st.session_state:
-    st.session_state.sizer_app = "FanDuel"
-if "scan_rows" not in st.session_state:
-    st.session_state.scan_rows = []
-if "scan_meta" not in st.session_state:
-    st.session_state.scan_meta = ""
+def parse_odds_payload(payload, matchup: str):
+    rows = []
+    books_obj = payload.get("bookmakerOdds") or payload.get("bookmakers") or {}
+    if not isinstance(books_obj, dict): return rows
+    for b_slug, b_data in books_obj.items():
+        if not isinstance(b_data, dict): continue
+        app_lbl = BOOK_MAP.get(b_slug.lower(), b_slug)
+        markets = b_data.get("markets") or {}
+        if not isinstance(markets, dict): continue
+        for m_id, m_data in markets.items():
+            if not isinstance(m_data, dict): continue
+            m_name = m_data.get("marketName") or m_data.get("name") or f"Market {m_id}"
+            outcomes = m_data.get("outcomes") or {}
+            if not isinstance(outcomes, dict): continue
+            for o_id, o_data in outcomes.items():
+                if not isinstance(o_data, dict): continue
+                players = o_data.get("players") or {"0": o_data}
+                if not isinstance(players, dict): players = {"0": o_data}
+                for p_id, p_data in players.items():
+                    if not isinstance(p_data, dict): continue
+                    if p_data.get("active") is False: continue
+                    am = p_data.get("priceAmerican")
+                    dec = p_data.get("price")
+                    if am is None and dec is not None:
+                        try: am = dec_to_am(float(dec))
+                        except Exception: continue
+                    if am is None: continue
+                    try: am_int = int(round(float(am)))
+                    except Exception: continue
+                    o_name = p_data.get("outcomeName") or o_data.get("outcomeName") or o_data.get("name") or f"Outcome {o_id}"
+                    p_name = p_data.get("playerName") or ""
+                    line = p_data.get("handicap") or m_data.get("handicap") or ""
+                    desc = " ".join(x for x in [p_name, m_name, o_name, str(line)] if str(x).strip()).strip()
+                    rows.append({"Book": app_lbl, "Market": desc, "Odds": am_int, "Dec": dec, "Label": f"[{app_lbl}] {desc} ({am_int:+d})", "FullMkt": f"{matchup} · {desc}"})
+    return rows
+
+if "br_state" not in st.session_state: st.session_state.br_state = load_saved_br()
+if "sizer_mkt" not in st.session_state: st.session_state.sizer_mkt = "NBA Cup Prop"
+if "sizer_odds" not in st.session_state: st.session_state.sizer_odds = -220
+if "sizer_app" not in st.session_state: st.session_state.sizer_app = "FanDuel"
+if "scan_rows" not in st.session_state: st.session_state.scan_rows = []
+if "scan_meta" not in st.session_state: st.session_state.scan_meta = ""
+if "live_odds_rows" not in st.session_state: st.session_state.live_odds_rows = []
+if "live_odds_raw" not in st.session_state: st.session_state.live_odds_raw = None
 
 st.title("Asymmetric Betting Hub")
 st.caption("NBA Cup Slate · Nov 20, 2026 · 80% Floor · Layer 3 Ladder · Fractional Kelly")
@@ -111,10 +147,8 @@ with st.sidebar:
     st.divider()
     st.metric("Combined Total Bankroll", f"${total_bankroll:.2f}")
     api_key = get_key()
-    if api_key:
-        st.success("OddsPapi Key Ready")
-    else:
-        st.warning("OddsPapi Key Missing")
+    if api_key: st.success("OddsPapi Key Ready")
+    else: st.warning("OddsPapi Key Missing")
 
 t1, t2, t3, t4 = st.tabs(["80% Floor & Kelly", "Layer 3 Ladder", "Scanner & Cache", "Bet Log"])
 
@@ -131,10 +165,8 @@ with t1:
     st.caption(f"{app_name} Bankroll: ${active_br:.2f} · {app_name} Max Cap ({cap_pct:.1f}%): ${active_cap:.2f}")
     st.metric("Implied Prob", f"{imp_prob(float(odds))*100:.1f}%")
     st.metric("Suggested Stake", f"${stake:.2f}")
-    if prob >= 80.0:
-        st.success("PASSES 80% FLOOR")
-    else:
-        st.error("BELOW 80% FLOOR")
+    if prob >= 80.0: st.success("PASSES 80% FLOOR")
+    else: st.error("BELOW 80% FLOOR")
     if st.button("Log Bet"):
         row = pd.DataFrame([{"id": int(datetime.now().timestamp()*1000), "ts": datetime.now().isoformat(timespec="seconds"), "app": app_name, "mkt": mkt, "odds": int(odds), "prob": float(prob), "stake": float(stake), "status": "OPEN", "pnl": 0.0}])
         out = pd.concat([pd.read_csv(LOG_PATH), row], ignore_index=True) if LOG_PATH.exists() else row
@@ -149,28 +181,57 @@ with t2:
 with t3:
     found = [{"File": p.name, "KB": round(p.stat().st_size/1024, 1)} for p in CACHES if p.exists()]
     if found: st.dataframe(pd.DataFrame(found), use_container_width=True, hide_index=True)
-    if st.button("Test OddsPapi"):
+    if st.button("Pull Upcoming NBA Games"):
         if not api_key: st.error("Set ODDSPAPI_API_KEY in Secrets or .env")
         else:
-            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "tournamentId": 132, "upcoming": "true"}, timeout=12)
+            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "tournamentId": 132, "statusId": 0}, timeout=12)
             st.write(f"Status: {r.status_code}")
             if r.status_code == 200:
                 parsed, up_cnt, tot_cnt = parse_fixtures(r.json())
                 st.session_state.scan_rows = parsed
                 st.session_state.scan_meta = f"Upcoming from today: {up_cnt} | Total returned: {tot_cnt}"
-    if st.session_state.scan_meta:
-        st.caption(st.session_state.scan_meta)
+                st.session_state.live_odds_rows = []
+    if st.session_state.scan_meta: st.caption(st.session_state.scan_meta)
     if st.session_state.scan_rows:
-        df_scan = pd.DataFrame(st.session_state.scan_rows)[["Matchup", "Start", "Books"]]
+        df_scan = pd.DataFrame(st.session_state.scan_rows)[["Matchup", "Start", "HasOdds"]]
         st.dataframe(df_scan, use_container_width=True, hide_index=True)
-        pick_lbl = st.selectbox("Select Fixture to Send to Sizer", [x["Matchup"] for x in st.session_state.scan_rows])
+        label_map = {x["Label"]: x for x in st.session_state.scan_rows}
+        pick_lbl = st.selectbox("Select Fixture", list(label_map.keys()))
+        chosen = label_map[pick_lbl]
+        if st.button("Fetch Live Odds for Selected Game"):
+            ro = requests.get("https://api.oddspapi.io/v4/odds", params={"apiKey": api_key, "fixtureId": chosen["fixtureId"], "bookmakers": "fanduel,draftkings,kalshi,polymarket", "oddsFormat": "american", "verbosity": 3}, timeout=15)
+            st.write(f"Live Odds Status: {ro.status_code}")
+            if ro.status_code == 200:
+                payload_o = ro.json()
+                st.session_state.live_odds_raw = payload_o
+                st.session_state.live_odds_rows = parse_odds_payload(payload_o, chosen["Matchup"])
+            else:
+                st.error(ro.text[:300])
+        if st.session_state.live_odds_rows:
+            st.subheader(f"Live Book Lines ({len(st.session_state.live_odds_rows)} outcomes)")
+            df_o = pd.DataFrame(st.session_state.live_odds_rows)[["Book", "Market", "Odds", "Dec"]]
+            st.dataframe(df_o, use_container_width=True, hide_index=True)
+            o_map = {x["Label"]: x for x in st.session_state.live_odds_rows}
+            pick_o_lbl = st.selectbox("Select Live Line to Send to Sizer", list(o_map.keys()))
+            if st.button("Load Live Line into Sizer"):
+                sel_o = o_map[pick_o_lbl]
+                st.session_state.sizer_mkt = sel_o["FullMkt"]
+                st.session_state.sizer_app = sel_o["Book"] if sel_o["Book"] in app_bankrolls else "FanDuel"
+                st.session_state.sizer_odds = int(sel_o["Odds"])
+                st.success(f"Loaded {sel_o[\x27Label\x27]} into 80% Floor & Kelly tab.")
+        elif st.session_state.live_odds_raw is not None:
+            st.info("No active lines returned for those 4 books yet on this fixture.")
+            with st.expander("Inspect Raw Odds JSON"):
+                st.json(st.session_state.live_odds_raw)
+        st.divider()
+        st.caption("Or send selected matchup manually with custom odds:")
         pick_app = st.selectbox("Target Book / App", list(app_bankrolls.keys()), key="scan_app")
-        pick_odds = st.number_input("Market Odds (American)", -2000, 2000, -150, 5, key="scan_odds")
-        if st.button("Load into Sizer"):
-            st.session_state.sizer_mkt = f"{pick_lbl} ML/Prop"
+        pick_odds = st.number_input("Custom Market Odds (American)", -2000, 2000, -150, 5, key="scan_odds")
+        if st.button("Load Manual Line into Sizer"):
+            st.session_state.sizer_mkt = f"{chosen[\x27Matchup\x27]} ML/Prop"
             st.session_state.sizer_app = pick_app
             st.session_state.sizer_odds = int(pick_odds)
-            st.success(f"Loaded {pick_lbl} into 80% Floor & Kelly tab.")
+            st.success(f"Loaded {chosen[\x27Matchup\x27]} into 80% Floor & Kelly tab.")
 
 with t4:
     if LOG_PATH.exists():
