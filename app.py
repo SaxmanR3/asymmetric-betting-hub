@@ -12,19 +12,21 @@ from dotenv import load_dotenv
 # --- SETUP ---
 load_dotenv()
 
-def _key() -> str:
+def get_api_key() -> str:
     try:
         if "ODDSPAPI_API_KEY" in st.secrets:
-            v = str(st.secrets["ODDSPAPI_API_KEY"]).strip()
-            if v:
-                return v
+            return str(st.secrets["ODDSPAPI_API_KEY"]).strip()
     except Exception:
         pass
     return os.getenv("ODDSPAPI_API_KEY", "").strip()
 
-API_KEY = _key()
+API_KEY = get_api_key()
 BASE_URL = "https://api.oddspapi.io/v4"
 LOG_FILE = "bet_log.csv"
+LOG_COLUMNS = [
+    "Date", "Platform", "Strategy", "Pick", "Stake",
+    "Odds", "Closing_Odds", "Result", "Profit", "CLV_Pct"
+]
 
 st.set_page_config(page_title="Asymmetric Betting Hub", layout="wide")
 st.title("Asymmetric Betting Hub")
@@ -76,10 +78,6 @@ def matches_league(fx: dict, league_filter: str) -> bool:
         return "nba" in tourn and "wnba" not in tourn
     if league_filter == "wnba":
         return "wnba" in tourn
-    if league_filter == "ncaa":
-        return any(k in tourn for k in ("ncaa", "college", "fbs", "fcs", "division i", "ncaab", "ncaaf"))
-    if league_filter == "nfl":
-        return "nfl" in tourn and "ncaa" not in tourn
     return league_filter in tourn
 
 BOOK_LABELS = {
@@ -93,8 +91,99 @@ BOOK_LABELS = {
     "bet365": "bet365",
 }
 
+PLATFORMS = ["FanDuel", "DraftKings", "PrizePicks", "Kalshi", "BetMGM", "Fanatics"]
+STRATEGIES = ["Combos/Singles", "Alt Ladder", "5/6-Pick Flex", "+EV Straight", "Promo/Boost", "Neg-Corr SGP"]
+
 def fmt_book(slug: str) -> str:
     return BOOK_LABELS.get(slug.lower(), slug.title())
+
+# --- PERSISTENT BET LOG ENGINE (SHARED ACROSS ALL TABS) ---
+def get_bet_log() -> pd.DataFrame:
+    if "bet_log_df" not in st.session_state:
+        if os.path.exists(LOG_FILE):
+            try:
+                df = pd.read_csv(LOG_FILE)
+                for col in LOG_COLUMNS:
+                    if col not in df.columns:
+                        df[col] = ""
+                st.session_state["bet_log_df"] = df[LOG_COLUMNS]
+            except Exception:
+                st.session_state["bet_log_df"] = pd.DataFrame(columns=LOG_COLUMNS)
+        else:
+            st.session_state["bet_log_df"] = pd.DataFrame(columns=LOG_COLUMNS)
+    return st.session_state["bet_log_df"]
+
+def save_bet_log(df: pd.DataFrame):
+    df = df[LOG_COLUMNS].copy()
+    st.session_state["bet_log_df"] = df
+    try:
+        df.to_csv(LOG_FILE, index=False)
+    except Exception:
+        pass
+
+def append_bet_record(b_date, plat: str, strat: str, pick: str, stake: float, odds: int, close_odds: int, res: str):
+    df = get_bet_log()
+    profit = 0.0
+    if res == "Win":
+        profit = round(stake * (amer_to_dec(odds) - 1.0), 2)
+    elif res == "Loss":
+        profit = round(-float(stake), 2)
+    clv_pct = round((amer_to_prob(close_odds) - amer_to_prob(odds)) * 100.0, 2)
+    new_row = pd.DataFrame([{
+        "Date": str(b_date),
+        "Platform": plat,
+        "Strategy": strat,
+        "Pick": pick.strip(),
+        "Stake": round(float(stake), 2),
+        "Odds": int(odds),
+        "Closing_Odds": int(close_odds),
+        "Result": res,
+        "Profit": profit,
+        "CLV_Pct": clv_pct,
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
+    save_bet_log(df)
+
+def render_inline_bet_logger(
+    key_prefix: str,
+    default_plat: str = "FanDuel",
+    default_strat: str = "Combos/Singles",
+    default_pick: str = "",
+    default_stake: float = 2.0,
+    default_odds: int = -110,
+    expanded: bool = False,
+):
+    """Reusable inline bet logger + recent log drawer for every tab."""
+    st.divider()
+    with st.expander(f"Quick Bet Logger & Live Log ({len(get_bet_log())} logged)", expanded=expanded):
+        with st.form(f"{key_prefix}_quick_log_form", clear_on_submit=False):
+            c1, c2, c3, c4 = st.columns([1.1, 1.2, 1.3, 2.4])
+            b_date = c1.date_input("Date", value=date.today(), key=f"{key_prefix}_date")
+            plat_idx = PLATFORMS.index(default_plat) if default_plat in PLATFORMS else 0
+            b_plat = c2.selectbox("Platform", PLATFORMS, index=plat_idx, key=f"{key_prefix}_plat")
+            strat_idx = STRATEGIES.index(default_strat) if default_strat in STRATEGIES else 0
+            b_strat = c3.selectbox("Strategy", STRATEGIES, index=strat_idx, key=f"{key_prefix}_strat")
+            b_pick = c4.text_input("Pick Description", value=default_pick, key=f"{key_prefix}_pick")
+
+            c5, c6, c7, c8, c9 = st.columns([1.0, 1.0, 1.1, 1.1, 1.2])
+            b_stake = c5.number_input("Stake ($)", min_value=0.25, value=max(0.25, float(default_stake)), step=0.25, key=f"{key_prefix}_stake")
+            b_odds = c6.number_input("Bet Odds", value=int(default_odds), step=5, key=f"{key_prefix}_odds")
+            b_close = c7.number_input("Closing Odds", value=int(default_odds), step=5, key=f"{key_prefix}_close")
+            b_res = c8.selectbox("Result", ["Pending", "Win", "Loss", "Void"], key=f"{key_prefix}_res")
+            c9.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            submitted = c9.form_submit_button("Log Bet", width="stretch")
+
+            if submitted:
+                if not b_pick.strip():
+                    st.warning("Enter a Pick Description before logging.")
+                else:
+                    append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
+                    st.success(f"Logged: {b_pick.strip()} (${b_stake:.2f} @ {int(b_odds):+d}) on {b_plat}")
+
+        df_now = get_bet_log()
+        if not df_now.empty:
+            st.caption("Recent Entries (Full history, settlement & CSV backup in Tab 5)")
+            st.dataframe(df_now.tail(5).iloc[::-1], width="stretch")
 
 def load_market_catalog(sport_id: int) -> dict:
     """Load market names/metadata from local cache or OddsPapi /v4/markets (1 credit once per sport)."""
@@ -111,9 +200,6 @@ def load_market_catalog(sport_id: int) -> dict:
             return catalog
         except Exception:
             pass
-
-    if not API_KEY:
-        return {}
 
     r = requests.get(
         f"{BASE_URL}/markets",
@@ -276,6 +362,7 @@ def scan_fixture_ev(b_odds: dict, catalog: dict, target_books: list, max_width: 
                         "Selection": sel_display,
                         "Book": fmt_book(tb),
                         "Book Odds": f"{soft_am:+d}",
+                        "Book_Odds_Int": int(soft_am),
                         "Sharp Ref": f"{fmt_book(ref_book)} ({r_this:+d}/{r_opp:+d})",
                         "Fair Odds": f"{prob_to_amer(f_prob):+d}",
                         "True %": round(f_prob * 100.0, 1),
@@ -303,13 +390,13 @@ SD_MULTIPLIERS = {
 }
 
 DEFAULT_SPORTS = {
-    "Pro Football (NFL)": {"sportId": 14, "filter": "nfl"},
-    "College Football (NCAAF)": {"sportId": 14, "filter": "ncaa"},
-    "Pro Basketball (NBA)": {"sportId": 11, "filter": "nba"},
-    "College Basketball (NCAAB)": {"sportId": 11, "filter": "ncaa"},
-    "Pro Women's Basketball (WNBA)": {"sportId": 11, "filter": "wnba"},
-    "Pro Hockey (NHL)": {"sportId": 15, "filter": "nhl"},
-    "Pro Baseball (MLB)": {"sportId": 13, "filter": "mlb"},
+    "NFL": {"sportId": 14, "filter": "nfl"},
+    "NCAAF (College Football)": {"sportId": 14, "filter": "ncaa"},
+    "NBA": {"sportId": 11, "filter": "nba"},
+    "NCAAB (College Basketball)": {"sportId": 11, "filter": "ncaa"},
+    "WNBA": {"sportId": 11, "filter": "wnba"},
+    "NHL": {"sportId": 15, "filter": "nhl"},
+    "MLB": {"sportId": 13, "filter": "mlb"},
     "Soccer (MLS / EPL / UCL)": {"sportId": 10, "filter": ""},
     "Tennis (ATP / WTA)": {"sportId": 12, "filter": ""},
     "Boxing": {"sportId": 21, "filter": ""},
@@ -318,25 +405,31 @@ DEFAULT_SPORTS = {
 TARGET_SOFT_BOOKS = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics", "caesars", "bet365"]
 PRIORITY_BOOKS = ["pinnacle", "fanduel", "draftkings", "kalshi", "betmgm", "fanatics", "caesars", "bet365"]
 
-# --- SIDEBAR: LIVE BANKROLL ---
+# --- SIDEBAR: LIVE BANKROLL & EXPOSURE ---
 with st.sidebar:
     st.header("Bankroll & Unit Rules")
-    fd_bal = st.number_input("FanDuel ($)", min_value=0.0, value=25.00, step=0.5, format="%.2f")
-    dk_bal = st.number_input("DraftKings ($)", min_value=0.0, value=19.92, step=0.5, format="%.2f")
-    kalshi_bal = st.number_input("Kalshi ($)", min_value=0.0, value=10.00, step=0.5, format="%.2f")
-    pp_bal = st.number_input("PrizePicks ($)", min_value=0.0, value=0.00, step=0.5, format="%.2f")
-    mgm_bal = st.number_input("BetMGM ($)", min_value=0.0, value=0.00, step=0.5, format="%.2f")
-    fanatics_bal = st.number_input("Fanatics ($)", min_value=0.0, value=0.00, step=0.5, format="%.2f")
-    total_roll = round(fd_bal + dk_bal + kalshi_bal + pp_bal + mgm_bal + fanatics_bal, 2)
+    dk_bal = st.number_input("DraftKings ($)", min_value=0.0, value=40.12, step=1.0)
+    fd_bal = st.number_input("FanDuel ($)", min_value=0.0, value=14.80, step=1.0)
+    pp_bal = st.number_input("PrizePicks ($)", min_value=0.0, value=0.00, step=1.0)
+    kalshi_bal = st.number_input("Kalshi ($)", min_value=0.0, value=0.00, step=1.0)
+    mgm_bal = st.number_input("BetMGM ($)", min_value=0.0, value=0.00, step=1.0)
+    fanatics_bal = st.number_input("Fanatics ($)", min_value=0.0, value=0.00, step=1.0)
+    total_roll = dk_bal + fd_bal + pp_bal + kalshi_bal + mgm_bal + fanatics_bal
     st.metric("Total Active Roll", f"${total_roll:,.2f}")
     unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
     max_single_bet = round(total_roll * 0.05, 2)
     st.caption(f"5% Max Single-Ticket Cap: **${max_single_bet:.2f}**")
+
+    # Live Open Risk Exposure from bet_log
+    df_side = get_bet_log()
+    pending_risk = df_side[df_side["Result"] == "Pending"]["Stake"].sum() if not df_side.empty else 0.0
+    st.metric("Pending Risk Exposure", f"${pending_risk:,.2f}", f"{(pending_risk / total_roll * 100.0) if total_roll > 0 else 0.0:.1f}% of roll")
+
     st.divider()
     if API_KEY:
         st.success("OddsPapi Key Loaded")
     else:
-        st.warning("No ODDSPAPI_API_KEY in Secrets or .env")
+        st.warning("No ODDSPAPI_API_KEY found")
 
 # --- 5 MAIN TABS ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -348,40 +441,33 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: COMBOS & SINGLES (PER-LEG ENGINE)
+# TAB 1: COMBOS & SINGLES (PER-LEG GUARDRAIL)
 # ==========================================
 with tab1:
-    st.subheader("Combos & Singles Guardrail (Per-Leg Check)")
-    st.caption("Score each leg individually so one shaky leg doesn't disguise a weak combo.")
+    st.subheader("Combos & Singles Guardrail (Per-Leg Hit Rate)")
+    st.caption("Score each floor leg individually (PA / PRA / Rush+Rec) | 80% single BE: **-400** | 2x 80%: **-178** | 3x 80%: **-105**")
 
     c1, c2 = st.columns(2)
     with c1:
-        num_legs = st.radio("Number of Legs", [1, 2, 3], horizontal=True, index=2)
-        leg_probs = []
-        for idx in range(1, num_legs + 1):
-            p_leg = st.slider(
-                f"Leg {idx} Hit Rate (%)",
-                min_value=50,
-                max_value=95,
-                value=80,
-                key=f"leg_hit_{idx}",
-            ) / 100.0
-            leg_probs.append(p_leg)
-
+        num_legs = st.radio("Number of Floor Legs", [1, 2, 3], horizontal=True, index=2)
+        p1 = st.slider("Leg 1 Hit Rate (%)", 55, 95, 80) / 100.0
+        p2 = (st.slider("Leg 2 Hit Rate (%)", 55, 95, 80) / 100.0) if num_legs >= 2 else 1.0
+        p3 = (st.slider("Leg 3 Hit Rate (%)", 55, 95, 80) / 100.0) if num_legs >= 3 else 1.0
     with c2:
+        t1_plat = st.selectbox("Target Book", PLATFORMS, index=0, key="t1_plat_pick")
         posted_odds = st.number_input("Posted Ticket Odds (American)", value=-115, step=5)
-        if st.button("Check Injury Updates"):
-            st.info(
-                "Official & live injury boards:\n"
-                "- NBA Official Injury Report: https://official.nba.com/nba-injury-report/\n"
-                "- NFL Official Injury Report: https://www.nfl.com/injuries/\n"
-                "- College Basketball & Football News: https://www.espn.com/injuries/"
-            )
+        t1_desc = st.text_input("Combo / Single Description (auto-fills Bet Log)", placeholder="e.g., Henry 50+ Rush / Lamb 5+ Rec / Pollard 40+ Rush")
         injury_clear = st.checkbox("All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False)
 
-    comb_prob = 1.0
-    for p_val in leg_probs:
-        comb_prob *= p_val
+        with st.expander("Official Injury Report Quick Links"):
+            st.markdown(
+                "- [NFL Official Injury Report](https://www.nfl.com/injuries/)\n"
+                "- [NBA Official Injury Report](https://official.nba.com/nba-injury-report-2025-26-season/)\n"
+                "- [ESPN College Football Injuries](https://www.espn.com/college-football/injuries)\n"
+                "- [ESPN College Basketball Injuries](https://www.espn.com/mens-college-basketball/injuries)"
+            )
+
+    comb_prob = p1 * p2 * p3
     fair_odds = prob_to_amer(comb_prob)
     ev_pct = calc_ev(comb_prob, posted_odds)
 
@@ -390,44 +476,73 @@ with tab1:
     m2.metric("Fair Breakeven Odds", f"{fair_odds:+d}")
     m3.metric("Estimated EV", f"{ev_pct:+.1f}%")
 
+    straight_stake = min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size
+    kicker_stake = min(round(unit_size * 0.25, 2), max_single_bet) if max_single_bet > 0 else round(unit_size * 0.25, 2)
+
     if not injury_clear:
         st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
     elif ev_pct < 0:
         st.warning(f"JUICE LEAK: Posted {posted_odds:+d} is worse than your fair price ({fair_odds:+d}). Shop books or pass.")
     else:
-        straight_stake = round(min(unit_size, max_single_bet), 2)
-        kicker_stake = round(min(unit_size * 0.25, max_single_bet), 2)
-        if num_legs == 1:
-            st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Auto Straight Stake: **${straight_stake:.2f}** (capped at ${max_single_bet:.2f}).")
-        else:
-            st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Auto Split: **${straight_stake:.2f}** per straight + **${kicker_stake:.2f}** {num_legs}-leg combo kicker.")
+        st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Singles-First Split: **${straight_stake:.2f}** per straight + **${kicker_stake:.2f}** combo kicker.")
+
+    render_inline_bet_logger(
+        key_prefix="tab1",
+        default_plat=t1_plat,
+        default_strat="Combos/Singles",
+        default_pick=t1_desc,
+        default_stake=kicker_stake if num_legs > 1 else straight_stake,
+        default_odds=int(posted_odds),
+    )
 
 # ==========================================
 # TAB 2: PRIZEPICKS & +EV SCANNER (ODDSPAPI)
 # ==========================================
 with tab2:
     st.subheader("Live OddsPapi Feed + Auto Split-Devig & PrizePicks Scanner")
-    st.caption("College & Pro Separated | Main Lines -> Devig to **Pinnacle** | Player Props -> Devig to **FanDuel** | PP 5-Flex BE: **54.25% (-119)** | 6-Flex BE: **54.21% (-118)**")
+    st.caption("Main Lines -> Devig to **Pinnacle** | Player Props -> Devig to **FanDuel** | PP 5-Flex BE: **54.25% (-119)** | 6-Flex BE: **54.21% (-118)**")
 
     if "sport_map" not in st.session_state:
         st.session_state["sport_map"] = dict(DEFAULT_SPORTS)
 
+    # Preset Filter Chips (0 API Credits)
+    pc_a, pc_b, pc_c = st.columns(3)
+    if pc_a.button("Preset: Tight Lines (<=15c, >=3% EV)", width="stretch"):
+        st.session_state["t2_max_width"] = 15
+        st.session_state["t2_min_ev"] = 3.0
+    if pc_b.button("Preset: Standard (<=25c, >=2% EV)", width="stretch"):
+        st.session_state["t2_max_width"] = 25
+        st.session_state["t2_min_ev"] = 2.0
+    if pc_c.button("Select All 5 My Books", width="stretch"):
+        st.session_state["t2_books"] = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"]
+
     col_a, col_b, col_c = st.columns(3)
     selected_sport = col_a.selectbox("Sport / League", list(st.session_state["sport_map"].keys()))
-    max_width = col_b.number_input("Max Market Width (cents)", min_value=5, max_value=60, value=25)
-    min_ev = col_c.number_input("Min EV % to Flag", min_value=0.0, max_value=20.0, value=2.0, step=0.5)
+    max_width = col_b.number_input(
+        "Max Market Width (cents)",
+        min_value=5,
+        max_value=60,
+        value=st.session_state.get("t2_max_width", 25),
+    )
+    min_ev = col_c.number_input(
+        "Min EV % to Flag",
+        min_value=0.0,
+        max_value=20.0,
+        value=st.session_state.get("t2_min_ev", 2.0),
+        step=0.5,
+    )
 
     selected_books = st.multiselect(
         "Target Books to Shop",
         TARGET_SOFT_BOOKS,
-        default=["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"],
+        default=st.session_state.get("t2_books", ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"]),
         format_func=fmt_book,
     )
 
     b1, b2 = st.columns([2, 1])
     if b1.button("Pull Upcoming Fixtures (1 API Credit)"):
         if not API_KEY:
-            st.error("Add ODDSPAPI_API_KEY to Streamlit Secrets or .env first.")
+            st.error("Add ODDSPAPI_API_KEY to your .env file or Streamlit secrets first.")
         else:
             today = date.today()
             cfg = st.session_state["sport_map"][selected_sport]
@@ -458,7 +573,7 @@ with tab2:
 
     if b2.button("Load All Sports (UFC/Golf/etc.)"):
         if not API_KEY:
-            st.error("Add ODDSPAPI_API_KEY to Streamlit Secrets or .env first.")
+            st.error("Add ODDSPAPI_API_KEY to your .env file first.")
         else:
             try:
                 r = requests.get(f"{BASE_URL}/sports", params={"apiKey": API_KEY}, timeout=15)
@@ -478,6 +593,11 @@ with tab2:
             except Exception as e:
                 st.error(f"Connection error: {e}")
 
+    t2_prefill_plat = "DraftKings"
+    t2_prefill_strat = "+EV Straight"
+    t2_prefill_pick = ""
+    t2_prefill_odds = -110
+
     if "fixtures" in st.session_state and st.session_state["fixtures"]:
         search_txt = st.text_input("Filter by Team (optional, 0 credits)", value="").strip().lower()
         fx_options = {}
@@ -485,11 +605,11 @@ with tab2:
             fid = fx.get("fixtureId")
             if not fid:
                 continue
-            p1 = fx.get("participant1Name", "Away")
-            p2 = fx.get("participant2Name", "Home")
+            p1_name = fx.get("participant1Name", "Away")
+            p2_name = fx.get("participant2Name", "Home")
             tourn = fx.get("tournamentName") or fx.get("tournamentSlug") or ""
             stime = fx.get("startTime", "")[:16].replace("T", " ")
-            label = f"[{tourn}] {p1} vs {p2} ({stime})" if tourn else f"{p1} vs {p2} ({stime})"
+            label = f"[{tourn}] {p1_name} vs {p2_name} ({stime})" if tourn else f"{p1_name} vs {p2_name} ({stime})"
             if not search_txt or search_txt in label.lower():
                 fx_options[label] = fid
 
@@ -524,21 +644,45 @@ with tab2:
                 b_odds, catalog, selected_books, max_width, min_ev
             )
 
-            st.markdown(f"### Results: {st.session_state.get('last_scan_game', '')}")
+            scan_game = st.session_state.get("last_scan_game", "")
+            st.markdown(f"### Results: {scan_game}")
             key_books = [b for b in PRIORITY_BOOKS if b in b_odds]
             st.caption(f"Live sharp/target books in this scan: **{', '.join(fmt_book(b) for b in key_books)}** — Adjust Max Width, Min EV, or Target Books above to re-filter for 0 credits.")
 
             st.markdown(f"#### +EV Soft Book Plays ({len(ev_rows)} found)")
             if ev_rows:
-                st.dataframe(pd.DataFrame(ev_rows), width="stretch")
+                df_ev = pd.DataFrame(ev_rows).drop(columns=["Book_Odds_Int"])
+                st.dataframe(df_ev, width="stretch")
+
+                ev_choices = [
+                    f"{row['Book']} | {row['Market']}: {row['Selection']} ({row['Book Odds']}) [+{row['EV %']}% EV]"
+                    for row in ev_rows
+                ]
+                chosen_ev_idx = st.selectbox("Select +EV Play to Pre-Fill Bet Log Below", range(len(ev_choices)), format_func=lambda i: ev_choices[i])
+                picked_row = ev_rows[chosen_ev_idx]
+                t2_prefill_plat = picked_row["Book"] if picked_row["Book"] in PLATFORMS else "DraftKings"
+                t2_prefill_strat = "+EV Straight"
+                t2_prefill_pick = f"{picked_row['Market']}: {picked_row['Selection']} ({scan_game.split('(')[0].strip()})"
+                t2_prefill_odds = picked_row["Book_Odds_Int"]
             else:
-                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {', '.join(fmt_book(b) for b in selected_books)}. Try lowering Min EV to 1.0% or raising Max Width to 30c.")
+                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {', '.join(fmt_book(b) for b in selected_books)}.")
 
             st.markdown(f"#### PrizePicks 5/6-Flex Qualifying Props ({len(pp_rows)} found)")
             if pp_rows:
                 st.dataframe(pd.DataFrame(pp_rows), width="stretch")
+                pp_choices = [
+                    f"{row['Player']} — {row['Market']} ({row['Side']}) [{row['True Prob %']}% | +{row['6-Flex Edge %']}% 6-Flex]"
+                    for row in pp_rows
+                ]
+                chosen_pp_idx = st.selectbox("Or Select PrizePicks Flex Prop to Pre-Fill Bet Log", range(len(pp_choices)), format_func=lambda i: pp_choices[i])
+                if st.checkbox("Use selected PrizePicks prop in Bet Log below", value=False):
+                    pp_r = pp_rows[chosen_pp_idx]
+                    t2_prefill_plat = "PrizePicks"
+                    t2_prefill_strat = "5/6-Pick Flex"
+                    t2_prefill_pick = f"PP Flex: {pp_r['Player']} — {pp_r['Market']} ({pp_r['Side']})"
+                    t2_prefill_odds = -118
             else:
-                st.info(f"No two-way player props cleared 54.21% true probability under {max_width}c width yet (props often tighten closer to kickoff/tipoff).")
+                st.info(f"No two-way player props cleared 54.21% true probability under {max_width}c width yet (props tighten closer to kickoff/tipoff).")
 
             with st.expander("View Active Books & Market Counts"):
                 ordered_books = key_books + [b for b in b_odds.keys() if b not in key_books]
@@ -566,6 +710,15 @@ with tab2:
     if width_c > max_width:
         st.warning(f"WIDTH WARNING: {width_c:.0f}c exceeds your {max_width}c confidence cap. Book is guessing—size down or pass.")
 
+    render_inline_bet_logger(
+        key_prefix="tab2",
+        default_plat=t2_prefill_plat,
+        default_strat=t2_prefill_strat,
+        default_pick=t2_prefill_pick,
+        default_stake=min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size,
+        default_odds=t2_prefill_odds,
+    )
+
 # ==========================================
 # TAB 3: LAYER 3 SKEW & ALT LADDER
 # ==========================================
@@ -573,6 +726,7 @@ with tab3:
     st.subheader("Layer 3: Log-Normal Right Skew & Alt-Ladder Pricer")
     lc1, lc2 = st.columns(2)
     with lc1:
+        player_label = st.text_input("Player Name (optional, auto-fills Bet Log)", placeholder="e.g., Derrick Henry")
         prop_type = st.selectbox("Prop Type (SD Reference)", list(SD_MULTIPLIERS.keys()), index=6)
         proj_mean = st.number_input("Your Mean Projection", min_value=1.0, value=76.64, step=1.0)
         main_line = st.number_input("Sportsbook Main Line", min_value=0.5, value=70.5, step=0.5)
@@ -619,6 +773,19 @@ with tab3:
         })
     st.dataframe(pd.DataFrame(ladder_rows), width="stretch")
 
+    selected_rung = st.selectbox("Select Rung to Pre-Fill Bet Log", [row["Alt Line"] for row in ladder_rows], index=2)
+    p_prefix = f"{player_label.strip()} " if player_label.strip() else ""
+    t3_pick = f"{p_prefix}{selected_rung} {prop_type}".strip()
+
+    render_inline_bet_logger(
+        key_prefix="tab3",
+        default_plat="DraftKings",
+        default_strat="Alt Ladder",
+        default_pick=t3_pick,
+        default_stake=min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size,
+        default_odds=int(main_odds),
+    )
+
 # ==========================================
 # TAB 4: PROMO & BANKROLL GUARDRAILS
 # ==========================================
@@ -654,58 +821,123 @@ with tab4:
         st.metric("Hedge Stake Needed", f"${hedge_stake:.2f}")
         st.metric("Guaranteed Cash Profit", f"${guaranteed_profit:.2f}", f"{conv_rate:.1f}% Conversion")
 
+    capped_kelly = min(rec_stake, max_single_bet) if (rec_stake > 0 and max_single_bet > 0) else max(unit_size, rec_stake)
+    render_inline_bet_logger(
+        key_prefix="tab4",
+        default_plat="DraftKings",
+        default_strat="Promo/Boost",
+        default_pick=f"{promo_type.split('(')[0].strip()} Hedge (${guaranteed_profit:.2f} locked)",
+        default_stake=max(0.25, capped_kelly),
+        default_odds=int(k_odds),
+    )
+
 # ==========================================
-# TAB 5: ROI & CLV TRACKER
+# TAB 5: ROI & CLV TRACKER (MASTER LEDGER)
 # ==========================================
 with tab5:
-    st.subheader("Bet Log, Strategy ROI & Closing Line Value (CLV)")
-    if os.path.exists(LOG_FILE):
-        df_log = pd.read_csv(LOG_FILE)
-    else:
-        df_log = pd.DataFrame(columns=[
-            "Date", "Platform", "Strategy", "Pick", "Stake", "Odds", "Closing_Odds", "Result", "Profit", "CLV_Pct"
-        ])
+    st.subheader("Master Bet Log, Strategy ROI & Closing Line Value (CLV)")
+    df_log = get_bet_log()
+
+    # Backup & Restore Controls (protects against Streamlit Cloud restarts)
+    bk1, bk2 = st.columns([1.2, 2.8])
+    bk1.download_button(
+        label="Download bet_log.csv Backup",
+        data=df_log.to_csv(index=False).encode("utf-8"),
+        file_name=f"bet_log_backup_{date.today().isoformat()}.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+    uploaded_csv = bk2.file_uploader("Restore / Merge Backup CSV", type=["csv"], label_visibility="collapsed")
+    if uploaded_csv is not None:
+        try:
+            restored = pd.read_csv(uploaded_csv)
+            if set(LOG_COLUMNS).issubset(set(restored.columns)):
+                save_bet_log(restored[LOG_COLUMNS])
+                st.success(f"Restored {len(restored)} bets from backup CSV!")
+                st.rerun()
+            else:
+                st.error("CSV columns do not match bet_log.csv format.")
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
 
     with st.form("log_bet_form", clear_on_submit=True):
         f1, f2, f3, f4 = st.columns(4)
         b_date = f1.date_input("Date")
-        b_plat = f2.selectbox("Platform", ["FanDuel", "DraftKings", "PrizePicks", "Kalshi", "BetMGM", "Fanatics"])
-        b_strat = f3.selectbox("Strategy", ["Combos/Singles", "Alt Ladder", "5/6-Pick Flex", "Promo/Boost", "Neg-Corr SGP"])
+        b_plat = f2.selectbox("Platform", PLATFORMS)
+        b_strat = f3.selectbox("Strategy", STRATEGIES)
         b_pick = f4.text_input("Pick Description")
 
         f5, f6, f7, f8 = st.columns(4)
-        b_stake = f5.number_input("Stake ($)", min_value=0.5, value=2.0, step=0.5)
+        b_stake = f5.number_input("Stake ($)", min_value=0.25, value=2.0, step=0.25)
         b_odds = f6.number_input("Bet Odds", value=-110, step=5)
         b_close = f7.number_input("Closing Odds (for CLV)", value=-115, step=5)
         b_res = f8.selectbox("Result", ["Pending", "Win", "Loss", "Void"])
 
         submitted = st.form_submit_button("Log Bet")
-        if submitted and b_pick:
-            profit = 0.0
-            if b_res == "Win":
-                profit = round(b_stake * (amer_to_dec(b_odds) - 1.0), 2)
-            elif b_res == "Loss":
-                profit = -b_stake
-            clv_pct = round((amer_to_prob(b_close) - amer_to_prob(b_odds)) * 100.0, 2)
-            new_row = pd.DataFrame([{
-                "Date": str(b_date), "Platform": b_plat, "Strategy": b_strat,
-                "Pick": b_pick, "Stake": b_stake, "Odds": b_odds,
-                "Closing_Odds": b_close, "Result": b_res, "Profit": profit, "CLV_Pct": clv_pct
-            }])
-            df_log = pd.concat([df_log, new_row], ignore_index=True)
-            df_log.to_csv(LOG_FILE, index=False)
+        if submitted and b_pick.strip():
+            append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
             st.success("Bet logged to bet_log.csv!")
+            st.rerun()
 
+    df_log = get_bet_log()
     if not df_log.empty:
         settled = df_log[df_log["Result"].isin(["Win", "Loss"])]
         tot_staked = settled["Stake"].sum()
         tot_profit = settled["Profit"].sum()
         roi = (tot_profit / tot_staked * 100.0) if tot_staked > 0 else 0.0
         avg_clv = df_log["CLV_Pct"].mean()
+        win_rate = (len(settled[settled["Result"] == "Win"]) / len(settled) * 100.0) if len(settled) > 0 else 0.0
 
-        t1, t2, t3 = st.columns(3)
+        t1, t2, t3, t4 = st.columns(4)
         t1.metric("Net Profit", f"${tot_profit:+.2f}")
-        t2.metric("Overall ROI", f"{roi:+.1f}%")
+        t2.metric("Overall ROI", f"{roi:+.1f}%", f"Win Rate: {win_rate:.1f}%")
         t3.metric("Avg CLV", f"{avg_clv:+.2f}%")
+        t4.metric("Pending Tickets", f"{len(df_log[df_log['Result'] == 'Pending'])}")
 
-        st.dataframe(df_log, width="stretch")
+        st.markdown("#### Settle Pending Bets / Edit Ledger Directly")
+        st.caption("Update `Result` (Win / Loss / Void) or `Closing_Odds` directly in the table below and click **Save Ledger Changes** to recalculate Profit & CLV automatically.")
+        edited_df = st.data_editor(
+            df_log,
+            width="stretch",
+            num_rows="dynamic",
+            column_config={
+                "Platform": st.column_config.SelectboxColumn("Platform", options=PLATFORMS),
+                "Strategy": st.column_config.SelectboxColumn("Strategy", options=STRATEGIES),
+                "Result": st.column_config.SelectboxColumn("Result", options=["Pending", "Win", "Loss", "Void"]),
+            },
+            key="master_log_editor",
+        )
+        if st.button("Save Ledger Changes"):
+            for idx, row in edited_df.iterrows():
+                try:
+                    st_val = float(row["Stake"])
+                    od_val = int(row["Odds"])
+                    cl_val = int(row["Closing_Odds"])
+                    res_val = str(row["Result"])
+                    if res_val == "Win":
+                        edited_df.at[idx, "Profit"] = round(st_val * (amer_to_dec(od_val) - 1.0), 2)
+                    elif res_val == "Loss":
+                        edited_df.at[idx, "Profit"] = round(-st_val, 2)
+                    else:
+                        edited_df.at[idx, "Profit"] = 0.0
+                    edited_df.at[idx, "CLV_Pct"] = round((amer_to_prob(cl_val) - amer_to_prob(od_val)) * 100.0, 2)
+                except Exception:
+                    pass
+            save_bet_log(edited_df)
+            st.success("Ledger updated and saved to bet_log.csv!")
+            st.rerun()
+
+        if not settled.empty:
+            st.markdown("#### Performance Breakdown by Strategy")
+            strat_summary = (
+                settled.groupby("Strategy", as_index=False)
+                .agg(
+                    Bets=("Profit", "count"),
+                    Staked=("Stake", "sum"),
+                    Profit=("Profit", "sum"),
+                    Avg_CLV=("CLV_Pct", "mean"),
+                )
+            )
+            strat_summary["ROI %"] = (strat_summary["Profit"] / strat_summary["Staked"] * 100.0).round(1)
+            strat_summary["Avg_CLV"] = strat_summary["Avg_CLV"].round(2)
+            st.dataframe(strat_summary, width="stretch")
