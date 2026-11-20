@@ -1,264 +1,638 @@
-﻿import json, os
-from datetime import datetime, timezone
-from pathlib import Path
-import pandas as pd, requests, streamlit as st
+﻿import os
+import json
+import math
+from datetime import date, timedelta
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
+from scipy.stats import norm
 from dotenv import load_dotenv
 
 load_dotenv()
-st.set_page_config(page_title="Asymmetric Betting Hub", page_icon="🏀", layout="wide")
+BASE_URL = "https://api.oddspapi.io/v4"
+LOG_FILE = "bet_log.csv"
 
-BASE = Path(__file__).resolve().parent
-LOG_PATH = BASE / "bet_log.csv"
-BR_PATH = BASE / "bankrolls.json"
-CACHES = [BASE / "markets_cache_11.json", BASE / "markets_cache_14.json"]
-DEFAULT_BR = {"FanDuel": 25.00, "DraftKings": 19.92, "Kalshi": 10.00, "Polymarket": 0.00}
-BOOK_MAP = {"fanduel": "FanDuel", "draftkings": "DraftKings", "kalshi": "Kalshi", "polymarket": "Polymarket"}
-
-def get_key():
+def get_api_key() -> str:
     try:
         if "ODDSPAPI_API_KEY" in st.secrets:
-            v = str(st.secrets["ODDSPAPI_API_KEY"]).strip()
-            if v: return v
-    except Exception: pass
-    v = os.getenv("ODDSPAPI_API_KEY", "").strip()
-    return v or None
+            val = str(st.secrets["ODDSPAPI_API_KEY"]).strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return os.getenv("ODDSPAPI_API_KEY", "").strip()
 
-def load_saved_br():
-    if BR_PATH.exists():
+API_KEY = get_api_key()
+
+st.set_page_config(page_title="Asymmetric Betting Hub", layout="wide")
+st.title("Asymmetric Betting Hub")
+
+def amer_to_dec(odds: float) -> float:
+    return (1.0 + 100.0 / abs(odds)) if odds < 0 else (1.0 + odds / 100.0)
+
+def dec_to_amer(dec: float) -> int:
+    if dec <= 1.0:
+        return -10000
+    return round((dec - 1.0) * 100) if dec >= 2.0 else round(-100.0 / (dec - 1.0))
+
+def amer_to_prob(odds: float) -> float:
+    return (abs(odds) / (abs(odds) + 100.0)) if odds < 0 else (100.0 / (odds + 100.0))
+
+def prob_to_amer(p: float) -> int:
+    p = min(max(p, 0.001), 0.999)
+    return round(-100 * p / (1 - p)) if p >= 0.5 else round(100 * (1 - p) / p)
+
+def devig_two_way(odds_a: float, odds_b: float):
+    pa, pb = amer_to_prob(odds_a), amer_to_prob(odds_b)
+    overround = pa + pb
+    fair_a, fair_b = pa / overround, pb / overround
+    if odds_a < 0 and odds_b < 0:
+        width = abs(odds_a + 100) + abs(odds_b + 100)
+    elif odds_a < 0 and odds_b > 0:
+        width = abs(odds_a) - odds_b
+    elif odds_b < 0 and odds_a > 0:
+        width = abs(odds_b) - odds_a
+    else:
+        width = abs(odds_a - odds_b)
+    return fair_a, fair_b, (overround - 1.0) * 100.0, abs(width)
+
+def lognormal_params(mean: float, sd: float):
+    sigma = math.sqrt(math.log(1.0 + (sd / mean) ** 2))
+    mu = math.log(mean) - 0.5 * (sigma ** 2)
+    return mu, sigma
+
+def calc_ev(true_prob: float, book_odds: float) -> float:
+    return (true_prob * amer_to_dec(book_odds) - 1.0) * 100.0
+
+def matches_league(fx: dict, league_filter: str) -> bool:
+    if not league_filter:
+        return True
+    tourn = (fx.get("tournamentName") or fx.get("tournamentSlug") or "").lower()
+    if league_filter == "nba":
+        return "nba" in tourn and "wnba" not in tourn
+    if league_filter == "wnba":
+        return "wnba" in tourn
+    if league_filter == "ncaa":
+        return any(k in tourn for k in ("ncaa", "college", "fbs", "fcs", "division i", "cbb", "ncaab", "ncaaf"))
+    if league_filter == "nfl":
+        return "nfl" in tourn and "ncaa" not in tourn
+    return league_filter in tourn
+
+def classify_level(fx: dict, default_level: str = "Pro") -> str:
+    tourn = (fx.get("tournamentName") or fx.get("tournamentSlug") or "").lower()
+    if any(k in tourn for k in ("ncaa", "college", "fbs", "fcs", "division i", "ncaab", "ncaaf")):
+        return "College"
+    if any(k in tourn for k in ("nfl", "nba", "wnba", "nhl", "mlb", "mls", "epl", "ucl", "atp", "wta", "ufc")):
+        return "Pro"
+    return default_level
+
+BOOK_LABELS = {
+    "pinnacle": "Pinnacle",
+    "fanduel": "FanDuel",
+    "draftkings": "DraftKings",
+    "kalshi": "Kalshi",
+    "betmgm": "BetMGM",
+    "fanatics": "Fanatics",
+    "caesars": "Caesars",
+    "bet365": "bet365",
+}
+
+def fmt_book(slug: str) -> str:
+    return BOOK_LABELS.get(slug.lower(), slug.title())
+
+def load_market_catalog(sport_id: int) -> dict:
+    cache_key = f"market_catalog_{sport_id}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    cache_file = f"markets_cache_{sport_id}.json"
+    if os.path.exists(cache_file):
         try:
-            data = json.loads(BR_PATH.read_text(encoding="utf-8"))
-            return {k: round(float(data.get(k, DEFAULT_BR[k])), 2) for k in DEFAULT_BR}
-        except Exception: pass
-    return dict(DEFAULT_BR)
+            with open(cache_file, "r", encoding="utf-8") as f:
+                catalog = json.load(f)
+            st.session_state[cache_key] = catalog
+            return catalog
+        except Exception:
+            pass
+    if not API_KEY:
+        return {}
+    r = requests.get(
+        f"{BASE_URL}/markets",
+        params={"apiKey": API_KEY, "sportId": sport_id, "language": "en"},
+        timeout=20,
+    )
+    if r.status_code != 200:
+        return {}
+    raw = r.json()
+    catalog = {}
+    for m in raw:
+        mid = str(m.get("marketId"))
+        outcomes = {str(o.get("outcomeId")): o.get("outcomeName", str(o.get("outcomeId"))) for o in m.get("outcomes", [])}
+        catalog[mid] = {
+            "name": m.get("marketName") or f"Market {mid}",
+            "playerProp": bool(m.get("playerProp", False)),
+            "handicap": m.get("handicap"),
+            "period": m.get("period", ""),
+            "marketLength": m.get("marketLength", len(outcomes)),
+            "outcomes": outcomes,
+        }
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(catalog, f)
+    except Exception:
+        pass
+    st.session_state[cache_key] = catalog
+    return catalog
 
-def save_br(br_dict):
-    clean = {k: round(float(v), 2) for k, v in br_dict.items()}
-    BR_PATH.write_text(json.dumps(clean, indent=2), encoding="utf-8")
-
-def imp_prob(odds: float) -> float:
-    if odds == 0: return 0.0
-    return 100.0 / (odds + 100.0) if odds > 0 else abs(odds) / (abs(odds) + 100.0)
-
-def dec_to_am(dec: float) -> int:
-    if dec <= 1.0: return -100
-    if dec >= 2.0: return int(round((dec - 1.0) * 100))
-    return int(round(-100.0 / (dec - 1.0)))
-
-def payout_delta(stake: float, odds: float, result: str) -> float:
-    dec = (1.0 + odds / 100.0) if odds > 0 else (1.0 + 100.0 / abs(odds)) if odds < 0 else 1.0
-    if result == "WIN": return round(stake * (dec - 1.0), 2)
-    if result == "LOSS": return round(-stake, 2)
-    return 0.0
-
-def kelly_stake(p: float, odds: float, bankroll: float, frac: float, cap: float) -> float:
-    dec = (1.0 + odds / 100.0) if odds > 0 else (1.0 + 100.0 / abs(odds)) if odds < 0 else 1.0
-    b = dec - 1.0
-    if b <= 0 or not (0 < p < 1): return 0.0
-    edge = (b * p - (1.0 - p)) / b
-    if edge <= 0: return 0.0
-    return round(min(bankroll * edge * frac, cap, bankroll), 2)
-
-def pick_team(f, keys):
-    for k in keys:
-        v = f.get(k)
-        if isinstance(v, dict): v = v.get("name") or v.get("title")
-        if isinstance(v, str) and v.strip(): return v.strip()
+def parse_american_price(node: dict):
+    if not isinstance(node, dict) or not node.get("active", False):
+        return None
+    dec = node.get("price")
+    am_str = node.get("priceAmerican")
+    if am_str is not None:
+        try:
+            am_val = int(round(float(am_str)))
+            if am_val <= -100 or am_val >= 100:
+                return am_val
+        except (ValueError, TypeError):
+            pass
+    if dec is not None:
+        try:
+            dec_f = float(dec)
+            if dec_f > 1.01:
+                return dec_to_amer(dec_f)
+        except (ValueError, TypeError):
+            pass
     return None
 
-def parse_fixtures(payload):
-    items = payload if isinstance(payload, list) else payload.get("fixtures") or payload.get("data") or payload.get("items") or []
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    upcoming, all_parsed = [], []
-    for idx, f in enumerate(items):
-        if not isinstance(f, dict): continue
-        fid = str(f.get("fixtureId") or f.get("id") or f"game_{idx+1}")
-        away = pick_team(f, ["awayTeamName", "participant2Name", "away", "opponentName"]) or "Away"
-        home = pick_team(f, ["homeTeamName", "participant1Name", "home", "teamName"]) or "Home"
-        start = str(f.get("startTime") or f.get("commenceTime") or f.get("date") or "")[:16]
-        has_odds = bool(f.get("hasOdds", False))
-        rec = {"fixtureId": fid, "Matchup": f"{away} @ {home}", "Start": start, "HasOdds": has_odds, "Label": f"{away} @ {home} ({start})"}
-        all_parsed.append(rec)
-        if start[:10] >= now_iso:
-            upcoming.append(rec)
-    chosen = upcoming if upcoming else all_parsed
-    return chosen[:30], len(upcoming), len(all_parsed)
+def scan_fixture_ev(b_odds: dict, catalog: dict, target_books: list, max_width: int, min_ev: float):
+    candidate_pairs = set()
+    for ref_bk in ("pinnacle", "fanduel"):
+        markets = b_odds.get(ref_bk, {}).get("markets", {})
+        for mid, mdata in markets.items():
+            outcomes = mdata.get("outcomes", {})
+            if len(outcomes) != 2:
+                continue
+            for odata in outcomes.values():
+                for pid, pnode in odata.get("players", {}).items():
+                    if isinstance(pnode, dict) and pnode.get("active", False):
+                        candidate_pairs.add((mid, pid))
 
-def parse_odds_payload(payload, matchup: str):
-    rows = []
-    books_obj = payload.get("bookmakerOdds") or payload.get("bookmakers") or {}
-    if not isinstance(books_obj, dict): return rows
-    for b_slug, b_data in books_obj.items():
-        if not isinstance(b_data, dict): continue
-        app_lbl = BOOK_MAP.get(b_slug.lower(), b_slug)
-        markets = b_data.get("markets") or {}
-        if not isinstance(markets, dict): continue
-        for m_id, m_data in markets.items():
-            if not isinstance(m_data, dict): continue
-            m_name = m_data.get("marketName") or m_data.get("name") or f"Market {m_id}"
-            outcomes = m_data.get("outcomes") or {}
-            if not isinstance(outcomes, dict): continue
-            for o_id, o_data in outcomes.items():
-                if not isinstance(o_data, dict): continue
-                players = o_data.get("players") or {"0": o_data}
-                if not isinstance(players, dict): players = {"0": o_data}
-                for p_id, p_data in players.items():
-                    if not isinstance(p_data, dict): continue
-                    if p_data.get("active") is False: continue
-                    am = p_data.get("priceAmerican")
-                    dec = p_data.get("price")
-                    if am is None and dec is not None:
-                        try: am = dec_to_am(float(dec))
-                        except Exception: continue
-                    if am is None: continue
-                    try: am_int = int(round(float(am)))
-                    except Exception: continue
-                    o_name = p_data.get("outcomeName") or o_data.get("outcomeName") or o_data.get("name") or f"Outcome {o_id}"
-                    p_name = p_data.get("playerName") or ""
-                    line = p_data.get("handicap") or m_data.get("handicap") or ""
-                    desc = " ".join(x for x in [p_name, m_name, o_name, str(line)] if str(x).strip()).strip()
-                    rows.append({"Book": app_lbl, "Market": desc, "Odds": am_int, "Dec": dec, "Label": f"[{app_lbl}] {desc} ({am_int:+d})", "FullMkt": f"{matchup} · {desc}"})
-    return rows
+    ev_rows = []
+    pp_rows = []
 
-if "br_state" not in st.session_state: st.session_state.br_state = load_saved_br()
-if "sizer_mkt" not in st.session_state: st.session_state.sizer_mkt = "NBA Cup Prop"
-if "sizer_odds" not in st.session_state: st.session_state.sizer_odds = -220
-if "sizer_app" not in st.session_state: st.session_state.sizer_app = "FanDuel"
-if "scan_rows" not in st.session_state: st.session_state.scan_rows = []
-if "scan_meta" not in st.session_state: st.session_state.scan_meta = ""
-if "live_odds_rows" not in st.session_state: st.session_state.live_odds_rows = []
-if "live_odds_raw" not in st.session_state: st.session_state.live_odds_raw = None
+    for mid, pid in candidate_pairs:
+        meta = catalog.get(mid, {})
+        is_prop = meta.get("playerProp", pid != "0") or (pid != "0")
+        m_name = meta.get("name", f"Market {mid}")
+        out_names = meta.get("outcomes", {})
 
-st.title("Asymmetric Betting Hub")
-st.caption("NBA Cup Slate · Nov 20, 2026 · 80% Floor · Layer 3 Ladder · Fractional Kelly")
+        ref_order = ["fanduel", "pinnacle"] if is_prop else ["pinnacle", "fanduel"]
+        ref_book = None
+        ref_sides = None
+        player_name = ""
+
+        for candidate_ref in ref_order:
+            mdata = b_odds.get(candidate_ref, {}).get("markets", {}).get(mid)
+            if not mdata:
+                continue
+            outcomes = mdata.get("outcomes", {})
+            if len(outcomes) != 2:
+                continue
+            oids = list(outcomes.keys())
+            n0 = outcomes[oids[0]].get("players", {}).get(pid)
+            n1 = outcomes[oids[1]].get("players", {}).get(pid)
+            a0 = parse_american_price(n0)
+            a1 = parse_american_price(n1)
+            if a0 is not None and a1 is not None:
+                ref_book = candidate_ref
+                ref_sides = (oids[0], a0, oids[1], a1)
+                if is_prop:
+                    player_name = (n0.get("playerName") or n1.get("playerName") or f"Player {pid}")
+                break
+
+        if not ref_book or not ref_sides:
+            continue
+
+        oid0, odds0, oid1, odds1 = ref_sides
+        fair_p0, fair_p1, vig_pct, width_c = devig_two_way(odds0, odds1)
+
+        if width_c > max_width:
+            continue
+
+        label0 = out_names.get(oid0, f"Outcome {oid0}")
+        label1 = out_names.get(oid1, f"Outcome {oid1}")
+        sides_info = [
+            (oid0, label0, fair_p0, odds0, odds1),
+            (oid1, label1, fair_p1, odds1, odds0),
+        ]
+
+        if is_prop:
+            for oid, s_label, f_prob, r_this, r_opp in sides_info:
+                edge_6 = (f_prob - 0.5421) * 100.0
+                edge_5 = (f_prob - 0.5425) * 100.0
+                if edge_6 > 0:
+                    pp_rows.append({
+                        "Player": player_name,
+                        "Market": m_name,
+                        "Side": s_label,
+                        "Ref Book": fmt_book(ref_book),
+                        "Ref Line": f"{r_this:+d} / {r_opp:+d}",
+                        "True Prob %": round(f_prob * 100.0, 2),
+                        "Width (c)": int(round(width_c)),
+                        "6-Flex Edge %": round(edge_6, 2),
+                        "5-Flex Edge %": round(edge_5, 2),
+                    })
+
+        for tb in target_books:
+            if tb == ref_book or tb not in b_odds:
+                continue
+            tb_m = b_odds[tb].get("markets", {}).get(mid)
+            if not tb_m:
+                continue
+            tb_outs = tb_m.get("outcomes", {})
+            for oid, s_label, f_prob, r_this, r_opp in sides_info:
+                pnode = tb_outs.get(oid, {}).get("players", {}).get(pid)
+                soft_am = parse_american_price(pnode)
+                if soft_am is None:
+                    continue
+                ev_pct = calc_ev(f_prob, soft_am)
+                if ev_pct >= min_ev:
+                    sel_display = f"{player_name} — {s_label}" if is_prop else s_label
+                    ev_rows.append({
+                        "Type": "Prop" if is_prop else "Main",
+                        "Market": m_name,
+                        "Selection": sel_display,
+                        "Book": fmt_book(tb),
+                        "Book Odds": f"{soft_am:+d}",
+                        "Sharp Ref": f"{fmt_book(ref_book)} ({r_this:+d}/{r_opp:+d})",
+                        "Fair Odds": f"{prob_to_amer(f_prob):+d}",
+                        "True %": round(f_prob * 100.0, 1),
+                        "Width (c)": int(round(width_c)),
+                        "EV %": round(ev_pct, 2),
+                    })
+
+    ev_rows.sort(key=lambda x: x["EV %"], reverse=True)
+    pp_rows.sort(key=lambda x: x["True Prob %"], reverse=True)
+    return ev_rows, pp_rows
+
+SD_MULTIPLIERS = {
+    "Pass Attempts": 0.25,
+    "Completions": 0.28,
+    "Passing Yards": 0.31,
+    "Carries": 0.39,
+    "Receptions": 0.53,
+    "Rush + Rec Yards": 0.50,
+    "Rushing Yards (Overall)": 0.56,
+    "Rushing Yards (<60 YPG)": 0.63,
+    "Rushing Yards (60-80 YPG)": 0.52,
+    "Rushing Yards (80+ YPG)": 0.42,
+    "Receiving Yards (WR)": 0.64,
+    "Receiving Yards (TE)": 0.69,
+}
+
+DEFAULT_SPORTS = {
+    "Pro Football (NFL)": {"sportId": 14, "filter": "nfl", "level": "Pro"},
+    "College Football (NCAAF)": {"sportId": 14, "filter": "ncaa", "level": "College"},
+    "Pro Basketball (NBA)": {"sportId": 11, "filter": "nba", "level": "Pro"},
+    "College Basketball (NCAAB)": {"sportId": 11, "filter": "ncaa", "level": "College"},
+    "Pro Women\x27s Basketball (WNBA)": {"sportId": 11, "filter": "wnba", "level": "Pro"},
+    "Pro Hockey (NHL)": {"sportId": 15, "filter": "nhl", "level": "Pro"},
+    "Pro Baseball (MLB)": {"sportId": 13, "filter": "mlb", "level": "Pro"},
+    "Soccer (MLS / EPL / UCL)": {"sportId": 10, "filter": "", "level": "Pro"},
+    "Tennis (ATP / WTA)": {"sportId": 12, "filter": "", "level": "Pro"},
+    "Boxing": {"sportId": 21, "filter": "", "level": "Pro"},
+}
+
+TARGET_SOFT_BOOKS = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics", "caesars", "bet365"]
+PRIORITY_BOOKS = ["pinnacle", "fanduel", "draftkings", "kalshi", "betmgm", "fanatics", "caesars", "bet365"]
 
 with st.sidebar:
-    st.subheader("Bankroll by App")
-    fd_br = st.number_input("FanDuel ($)", 0.0, 100000.0, float(st.session_state.br_state["FanDuel"]), 0.5, "%.2f")
-    dk_br = st.number_input("DraftKings ($)", 0.0, 100000.0, float(st.session_state.br_state["DraftKings"]), 0.5, "%.2f")
-    kl_br = st.number_input("Kalshi ($)", 0.0, 100000.0, float(st.session_state.br_state["Kalshi"]), 0.5, "%.2f")
-    pm_br = st.number_input("Polymarket ($)", 0.0, 100000.0, float(st.session_state.br_state["Polymarket"]), 0.5, "%.2f")
-    app_bankrolls = {"FanDuel": round(fd_br, 2), "DraftKings": round(dk_br, 2), "Kalshi": round(kl_br, 2), "Polymarket": round(pm_br, 2)}
-    if app_bankrolls != st.session_state.br_state:
-        st.session_state.br_state = dict(app_bankrolls)
-        save_br(app_bankrolls)
-    total_bankroll = round(sum(app_bankrolls.values()), 2)
-    cap_pct = st.slider("Max Stake Cap (%)", 1.0, 10.0, 5.0, 0.5)
-    kelly_f = st.selectbox("Kelly Fraction", [0.1, 0.25, 0.5, 1.0], 1, format_func=lambda x: f"{int(x*100)}%")
+    st.header("Bankroll & Unit Rules")
+    fd_bal = st.number_input("FanDuel ($)", min_value=0.0, value=25.00, step=0.5, format="%.2f")
+    dk_bal = st.number_input("DraftKings ($)", min_value=0.0, value=19.92, step=0.5, format="%.2f")
+    kalshi_bal = st.number_input("Kalshi ($)", min_value=0.0, value=10.00, step=0.5, format="%.2f")
+    pp_bal = st.number_input("PrizePicks ($)", min_value=0.0, value=0.00, step=0.5, format="%.2f")
+    mgm_bal = st.number_input("BetMGM ($)", min_value=0.0, value=0.00, step=0.5, format="%.2f")
+    fanatics_bal = st.number_input("Fanatics ($)", min_value=0.0, value=0.00, step=0.5, format="%.2f")
+    total_roll = round(fd_bal + dk_bal + kalshi_bal + pp_bal + mgm_bal + fanatics_bal, 2)
+    st.metric("Total Active Roll", f"${total_roll:,.2f}")
+    unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
+    max_single_bet = round(total_roll * 0.05, 2)
+    st.caption(f"5% Max Single-Ticket Cap: **${max_single_bet:.2f}**")
     st.divider()
-    st.metric("Combined Total Bankroll", f"${total_bankroll:.2f}")
-    api_key = get_key()
-    if api_key: st.success("OddsPapi Key Ready")
-    else: st.warning("OddsPapi Key Missing")
-
-t1, t2, t3, t4 = st.tabs(["80% Floor & Kelly", "Layer 3 Ladder", "Scanner & Cache", "Bet Log"])
-
-with t1:
-    c0, c1, c2, c3 = st.columns(4)
-    app_idx = list(app_bankrolls.keys()).index(st.session_state.sizer_app) if st.session_state.sizer_app in app_bankrolls else 0
-    app_name = c0.selectbox("Betting App", list(app_bankrolls.keys()), index=app_idx)
-    mkt = c1.text_input("Market", value=st.session_state.sizer_mkt)
-    prob = c2.slider("Floor Hit Prob (%)", 50.0, 99.0, 82.0, 0.5)
-    odds = c3.number_input("American Odds", -2000, 2000, int(st.session_state.sizer_odds), 5)
-    active_br = float(app_bankrolls[app_name])
-    active_cap = round(active_br * cap_pct / 100.0, 2)
-    stake = kelly_stake(prob / 100.0, float(odds), active_br, float(kelly_f), active_cap)
-    st.caption(f"{app_name} Bankroll: ${active_br:.2f} · {app_name} Max Cap ({cap_pct:.1f}%): ${active_cap:.2f}")
-    st.metric("Implied Prob", f"{imp_prob(float(odds))*100:.1f}%")
-    st.metric("Suggested Stake", f"${stake:.2f}")
-    if prob >= 80.0: st.success("PASSES 80% FLOOR")
-    else: st.error("BELOW 80% FLOOR")
-    if st.button("Log Bet"):
-        row = pd.DataFrame([{"id": int(datetime.now().timestamp()*1000), "ts": datetime.now().isoformat(timespec="seconds"), "app": app_name, "mkt": mkt, "odds": int(odds), "prob": float(prob), "stake": float(stake), "status": "OPEN", "pnl": 0.0}])
-        out = pd.concat([pd.read_csv(LOG_PATH), row], ignore_index=True) if LOG_PATH.exists() else row
-        out.to_csv(LOG_PATH, index=False)
-        st.success(f"Logged {mkt} (${stake:.2f}) on {app_name}")
-
-with t2:
-    base_line = st.number_input("Base Line", 0.5, 100.0, 20.0, 0.5)
-    rows = [{"Rung": i, "Alt": f"{round(base_line*m,1)}+", "Est %": f"{88-(i-1)*11:.1f}%", "Stake": kelly_stake((88-(i-1)*11)/100, -240 if i<=2 else -140, total_bankroll, kelly_f, round(total_bankroll*cap_pct/100.0, 2))} for i, m in enumerate([0.75, 0.85, 0.95, 1.0], 1)]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-with t3:
-    found = [{"File": p.name, "KB": round(p.stat().st_size/1024, 1)} for p in CACHES if p.exists()]
-    if found: st.dataframe(pd.DataFrame(found), use_container_width=True, hide_index=True)
-    if st.button("Pull Upcoming NBA Games"):
-        if not api_key: st.error("Set ODDSPAPI_API_KEY in Secrets or .env")
-        else:
-            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "tournamentId": 132, "statusId": 0}, timeout=12)
-            st.write(f"Status: {r.status_code}")
-            if r.status_code == 200:
-                parsed, up_cnt, tot_cnt = parse_fixtures(r.json())
-                st.session_state.scan_rows = parsed
-                st.session_state.scan_meta = f"Upcoming from today: {up_cnt} | Total returned: {tot_cnt}"
-                st.session_state.live_odds_rows = []
-    if st.session_state.scan_meta: st.caption(st.session_state.scan_meta)
-    if st.session_state.scan_rows:
-        df_scan = pd.DataFrame(st.session_state.scan_rows)[["Matchup", "Start", "HasOdds"]]
-        st.dataframe(df_scan, use_container_width=True, hide_index=True)
-        label_map = {x["Label"]: x for x in st.session_state.scan_rows}
-        pick_lbl = st.selectbox("Select Fixture", list(label_map.keys()))
-        chosen = label_map[pick_lbl]
-        if st.button("Fetch Live Odds for Selected Game"):
-            ro = requests.get("https://api.oddspapi.io/v4/odds", params={"apiKey": api_key, "fixtureId": chosen["fixtureId"], "bookmakers": "fanduel,draftkings,kalshi,polymarket", "oddsFormat": "american", "verbosity": 3}, timeout=15)
-            st.write(f"Live Odds Status: {ro.status_code}")
-            if ro.status_code == 200:
-                payload_o = ro.json()
-                st.session_state.live_odds_raw = payload_o
-                st.session_state.live_odds_rows = parse_odds_payload(payload_o, chosen["Matchup"])
-            else:
-                st.error(ro.text[:300])
-        if st.session_state.live_odds_rows:
-            st.subheader(f"Live Book Lines ({len(st.session_state.live_odds_rows)} outcomes)")
-            df_o = pd.DataFrame(st.session_state.live_odds_rows)[["Book", "Market", "Odds", "Dec"]]
-            st.dataframe(df_o, use_container_width=True, hide_index=True)
-            o_map = {x["Label"]: x for x in st.session_state.live_odds_rows}
-            pick_o_lbl = st.selectbox("Select Live Line to Send to Sizer", list(o_map.keys()))
-            if st.button("Load Live Line into Sizer"):
-                sel_o = o_map[pick_o_lbl]
-                st.session_state.sizer_mkt = sel_o["FullMkt"]
-                st.session_state.sizer_app = sel_o["Book"] if sel_o["Book"] in app_bankrolls else "FanDuel"
-                st.session_state.sizer_odds = int(sel_o["Odds"])
-                st.success(f"Loaded {sel_o[\x27Label\x27]} into 80% Floor & Kelly tab.")
-        elif st.session_state.live_odds_raw is not None:
-            st.info("No active lines returned for those 4 books yet on this fixture.")
-            with st.expander("Inspect Raw Odds JSON"):
-                st.json(st.session_state.live_odds_raw)
-        st.divider()
-        st.caption("Or send selected matchup manually with custom odds:")
-        pick_app = st.selectbox("Target Book / App", list(app_bankrolls.keys()), key="scan_app")
-        pick_odds = st.number_input("Custom Market Odds (American)", -2000, 2000, -150, 5, key="scan_odds")
-        if st.button("Load Manual Line into Sizer"):
-            st.session_state.sizer_mkt = f"{chosen[\x27Matchup\x27]} ML/Prop"
-            st.session_state.sizer_app = pick_app
-            st.session_state.sizer_odds = int(pick_odds)
-            st.success(f"Loaded {chosen[\x27Matchup\x27]} into 80% Floor & Kelly tab.")
-
-with t4:
-    if LOG_PATH.exists():
-        df_log = pd.read_csv(LOG_PATH)
-        if "status" not in df_log.columns: df_log["status"] = "OPEN"
-        if "pnl" not in df_log.columns: df_log["pnl"] = 0.0
-        if "id" not in df_log.columns: df_log["id"] = range(1, len(df_log)+1)
-        st.dataframe(df_log, use_container_width=True, hide_index=True)
-        open_bets = df_log[df_log["status"] == "OPEN"]
-        if not open_bets.empty:
-            st.subheader("Settle Open Bet & Update App Bankroll")
-            opt_map = {f"#{int(r.id)} | {r.app} | {r.mkt} (${r.stake:.2f} @ {int(r.odds)})": int(r.id) for _, r in open_bets.iterrows()}
-            sel_label = st.selectbox("Open Bet", list(opt_map.keys()))
-            outcome = st.radio("Result", ["WIN", "LOSS", "PUSH"], horizontal=True)
-            if st.button("Settle Bet"):
-                bet_id = opt_map[sel_label]
-                mask = df_log["id"] == bet_id
-                row = df_log[mask].iloc[0]
-                delta = payout_delta(float(row["stake"]), float(row["odds"]), outcome)
-                df_log.loc[mask, "status"] = outcome
-                df_log.loc[mask, "pnl"] = delta
-                df_log.to_csv(LOG_PATH, index=False)
-                b_app = str(row["app"])
-                if b_app in st.session_state.br_state:
-                    st.session_state.br_state[b_app] = round(max(0.0, float(st.session_state.br_state[b_app]) + delta), 2)
-                    save_br(st.session_state.br_state)
-                st.success(f"Settled as {outcome} (P&L: ${delta:+.2f}). Updated {b_app} bankroll and rerunning...")
-                st.rerun()
+    if API_KEY:
+        st.success("OddsPapi Key Loaded")
     else:
-        st.info("No bets logged yet.")
+        st.warning("No ODDSPAPI_API_KEY in Secrets or .env")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "1. Combos & Singles",
+    "2. PrizePicks & +EV Scanner",
+    "3. Layer 3 Skew & Alt Ladder",
+    "4. Promo & Bankroll Guardrails",
+    "5. ROI & CLV Tracker",
+])
+
+with tab1:
+    st.subheader("Combos & Singles Guardrail (PA / PRA / Rush+Rec)")
+    st.caption("80% single breakeven: **-400** | Two 80% legs: **64.0% (-178)** | Three 80% legs: **51.2% (-105)**")
+    c1, c2 = st.columns(2)
+    with c1:
+        num_legs = st.radio("Number of Floor Legs", [1, 2, 3], horizontal=True, index=2)
+        est_hit = st.slider("Estimated Hit Rate per Leg (%)", 65, 90, 80) / 100.0
+    with c2:
+        posted_odds = st.number_input("Posted Book Odds (American)", value=-115, step=5)
+        injury_clear = st.checkbox("All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False)
+    comb_prob = est_hit ** num_legs
+    fair_odds = prob_to_amer(comb_prob)
+    ev_pct = calc_ev(comb_prob, posted_odds)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Combined Hit Rate", f"{comb_prob*100:.1f}%")
+    m2.metric("Fair Breakeven Odds", f"{fair_odds:+d}")
+    m3.metric("Estimated EV", f"{ev_pct:+.1f}%")
+    if not injury_clear:
+        st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
+    elif ev_pct < 0:
+        st.warning(f"JUICE LEAK: Posted {posted_odds:+d} is worse than your fair price ({fair_odds:+d}). Shop books or pass.")
+    else:
+        st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Recommended Singles-First Split: **${unit_size:.2f}** per straight + **${unit_size*0.25:.2f}** combo kicker.")
+
+with tab2:
+    st.subheader("Live OddsPapi Feed + Auto Split-Devig & PrizePicks Scanner")
+    st.caption("College & Pro Separated | Main Lines -> Devig to **Pinnacle** | Player Props -> Devig to **FanDuel** | PP 5-Flex BE: **54.25%** | 6-Flex BE: **54.21**")
+    if "sport_map" not in st.session_state:
+        st.session_state["sport_map"] = dict(DEFAULT_SPORTS)
+    col_a, col_b, col_c, col_d = st.columns(4)
+    selected_sport = col_a.selectbox("Sport / League", list(st.session_state["sport_map"].keys()))
+    level_filter = col_b.selectbox("Level Split", ["All", "College Only", "Pro Only"])
+    max_width = col_c.number_input("Max Market Width (cents)", min_value=5, max_value=60, value=25)
+    min_ev = col_d.number_input("Min EV % to Flag", min_value=0.0, max_value=20.0, value=2.0, step=0.5)
+    selected_books = st.multiselect(
+        "Target Books to Shop",
+        TARGET_SOFT_BOOKS,
+        default=["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"],
+        format_func=fmt_book,
+    )
+    b1, b2 = st.columns([2, 1])
+    if b1.button("Pull Upcoming Fixtures (1 API Credit)"):
+        if not API_KEY:
+            st.error("Add ODDSPAPI_API_KEY to Streamlit Secrets or .env first.")
+        else:
+            today = date.today()
+            cfg = st.session_state["sport_map"][selected_sport]
+            params = {
+                "apiKey": API_KEY,
+                "sportId": cfg["sportId"],
+                "from": today.isoformat(),
+                "to": (today + timedelta(days=7)).isoformat(),
+                "hasOdds": "true",
+            }
+            try:
+                r = requests.get(f"{BASE_URL}/fixtures", params=params, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    raw_fixtures = data if isinstance(data, list) else data.get("fixtures", [])
+                    league_filter = cfg.get("filter", "")
+                    default_lvl = cfg.get("level", "Pro")
+                    fixtures = []
+                    for fx in raw_fixtures:
+                        if not matches_league(fx, league_filter):
+                            continue
+                        lvl = classify_level(fx, default_lvl)
+                        if level_filter == "College Only" and lvl != "College":
+                            continue
+                        if level_filter == "Pro Only" and lvl != "Pro":
+                            continue
+                        fx_copy = dict(fx)
+                        fx_copy["_level"] = lvl
+                        fixtures.append(fx_copy)
+                    st.session_state["fixtures"] = fixtures
+                    st.session_state["fixtures_sport_id"] = cfg["sportId"]
+                    if fixtures:
+                        st.success(f"Loaded {len(fixtures)} upcoming {selected_sport} games ({level_filter}).")
+                    else:
+                        st.warning(f"No upcoming {selected_sport} games found in the next 7 days.")
+                else:
+                    st.error(f"API Error {r.status_code}: {r.text[:250]}")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
+    if b2.button("Load All Sports (UFC/Golf/etc.)"):
+        if not API_KEY:
+            st.error("Add ODDSPAPI_API_KEY to Streamlit Secrets or .env first.")
+        else:
+            try:
+                r = requests.get(f"{BASE_URL}/sports", params={"apiKey": API_KEY}, timeout=15)
+                if r.status_code == 200:
+                    all_sports = r.json()
+                    merged = dict(DEFAULT_SPORTS)
+                    existing_ids = {v["sportId"] for v in merged.values()}
+                    for s in all_sports:
+                        name = s.get("sportName")
+                        sid = s.get("sportId")
+                        if name and sid and sid not in existing_ids:
+                            merged[name] = {"sportId": sid, "filter": "", "level": "Pro"}
+                    st.session_state["sport_map"] = merged
+                    st.rerun()
+                else:
+                    st.error(f"API Error {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
+    if "fixtures" in st.session_state and st.session_state["fixtures"]:
+        search_txt = st.text_input("Filter by Team (optional, 0 credits)", value="").strip().lower()
+        fx_options = {}
+        for fx in st.session_state["fixtures"]:
+            fid = fx.get("fixtureId")
+            if not fid:
+                continue
+            p1 = fx.get("participant1Name", "Away")
+            p2 = fx.get("participant2Name", "Home")
+            lvl = fx.get("_level", "Pro")
+            tourn = fx.get("tournamentName") or fx.get("tournamentSlug") or ""
+            stime = fx.get("startTime", "")[:16].replace("T", " ")
+            label = f"[{lvl} | {tourn}] {p1} vs {p2} ({stime})" if tourn else f"[{lvl}] {p1} vs {p2} ({stime})"
+            if not search_txt or search_txt in label.lower():
+                fx_options[label] = fid
+        if fx_options:
+            chosen_label = st.selectbox(f"Select Game to Scan ({len(fx_options)} found)", list(fx_options.keys())[:100])
+            if st.button("Scan & Find +EV / PrizePicks Plays (1 API Credit)"):
+                fid = fx_options[chosen_label]
+                sport_id = st.session_state.get("fixtures_sport_id", st.session_state["sport_map"][selected_sport]["sportId"])
+                with st.spinner("Pulling live board & running split-devig math..."):
+                    try:
+                        catalog = load_market_catalog(sport_id)
+                        r = requests.get(
+                            f"{BASE_URL}/odds",
+                            params={"apiKey": API_KEY, "fixtureId": fid},
+                            timeout=25,
+                        )
+                        if r.status_code == 200:
+                            data = r.json()
+                            b_odds = data.get("bookmakerOdds", {})
+                            st.session_state["last_scan_game"] = chosen_label
+                            st.session_state["last_b_odds"] = b_odds
+                            st.session_state["last_catalog"] = catalog
+                        else:
+                            st.error(f"API Error {r.status_code}: {r.text[:250]}")
+                    except Exception as e:
+                        st.error(f"Error fetching odds: {e}")
+        if "last_b_odds" in st.session_state and st.session_state["last_b_odds"]:
+            b_odds = st.session_state["last_b_odds"]
+            catalog = st.session_state.get("last_catalog", {})
+            ev_rows, pp_rows = scan_fixture_ev(b_odds, catalog, selected_books, max_width, min_ev)
+            st.markdown(f"### Results: {st.session_state.get(\x27last_scan_game\x27, \x27\x27)}")
+            key_books = [b for b in PRIORITY_BOOKS if b in b_odds]
+            st.caption(f"Live sharp/target books in this scan: **{ \x27, \x27.join(fmt_book(b) for b in key_books) }** — Adjust Max Width, Min EV, or Target Books above to re-filter for 0 credits.")
+            st.markdown(f"#### +EV Soft Book Plays ({len(ev_rows)} found)")
+            if ev_rows:
+                st.dataframe(pd.DataFrame(ev_rows), width="stretch")
+            else:
+                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {\x27, \x27.join(fmt_book(b) for b in selected_books)}.")
+            st.markdown(f"#### PrizePicks 5/6-Flex Qualifying Props ({len(pp_rows)} found)")
+            if pp_rows:
+                st.dataframe(pd.DataFrame(pp_rows), width="stretch")
+            else:
+                st.info(f"No two-way player props cleared 54.21% true probability under {max_width}c width yet.")
+            with st.expander("View Active Books & Market Counts"):
+                ordered_books = key_books + [b for b in b_odds.keys() if b not in key_books]
+                summary_rows = [{"Bookmaker": fmt_book(bk), "Active Markets": len(b_odds[bk].get("markets", {}))} for bk in ordered_books[:20]]
+                st.dataframe(pd.DataFrame(summary_rows), width="stretch")
+    st.divider()
+    st.markdown("#### Quick Manual Devig & PrizePicks Edge Checker (0 API Credits)")
+    qc1, qc2, qc3, qc4 = st.columns(4)
+    sharp_over = qc1.number_input("Sharp/FD Over Odds", value=-135, step=1)
+    sharp_under = qc2.number_input("Sharp/FD Under Odds", value=105, step=1)
+    target_book_odds = qc3.number_input("Soft Book Over Odds", value=-115, step=1)
+    pp_mode = qc4.selectbox("Compare vs. PrizePicks?", ["6-Pick Flex (54.21%)", "5-Pick Flex (54.25%)"])
+    fair_o, fair_u, vig_pct, width_c = devig_two_way(sharp_over, sharp_under)
+    soft_ev = calc_ev(fair_o, target_book_odds)
+    pp_be = 0.5421 if "6-Pick" in pp_mode else 0.5425
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("True Fair Over %", f"{fair_o*100:.2f}%", f"Fair {prob_to_amer(fair_o):+d}")
+    r2.metric("Market Width", f"{width_c:.0f} cents", f"Vig: {vig_pct:.2f}%")
+    r3.metric("Soft Book EV", f"{soft_ev:+.2f}%")
+    r4.metric("PrizePicks Edge", f"{(fair_o - pp_be)*100:+.2f}%", "PLAY" if fair_o > pp_be else "PASS")
+    if width_c > max_width:
+        st.warning(f"WIDTH WARNING: {width_c:.0f}c exceeds your {max_width}c confidence cap.")
+
+with tab3:
+    st.subheader("Layer 3: Log-Normal Right Skew & Alt-Ladder Pricer")
+    lc1, lc2 = st.columns(2)
+    with lc1:
+        prop_type = st.selectbox("Prop Type (SD Reference)", list(SD_MULTIPLIERS.keys()), index=6)
+        proj_mean = st.number_input("Your Mean Projection", min_value=1.0, value=76.64, step=1.0)
+        main_line = st.number_input("Sportsbook Main Line", min_value=0.5, value=70.5, step=0.5)
+        main_odds = st.number_input("Main Line Over Odds", value=-114, step=1)
+    with lc2:
+        raw_logs = st.text_input("Optional: Player Game Logs (comma-separated, overrides multiplier)", value="")
+        if raw_logs.strip():
+            try:
+                vals = [float(x.strip()) for x in raw_logs.split(",") if x.strip()]
+                sd_val = float(np.std(vals, ddof=1)) if len(vals) > 1 else proj_mean * SD_MULTIPLIERS[prop_type]
+                st.info(f"Measured SD from {len(vals)} games: **{sd_val:.2f}** (Mult: {sd_val/np.mean(vals):.2f})")
+            except ValueError:
+                sd_val = proj_mean * SD_MULTIPLIERS[prop_type]
+                st.error("Invalid game logs format. Using league multiplier.")
+        else:
+            sd_val = proj_mean * SD_MULTIPLIERS[prop_type]
+            st.info(f"Using League Multiplier **{SD_MULTIPLIERS[prop_type]}** -> SD = **{sd_val:.2f}**")
+    p_sym = 1.0 - norm.cdf(main_line, loc=proj_mean, scale=sd_val)
+    mu, sigma = lognormal_params(proj_mean, sd_val)
+    skew_median = math.exp(mu)
+    p_skew = 1.0 - norm.cdf(math.log(main_line), loc=mu, scale=sigma)
+    ev_sym = calc_ev(p_sym, main_odds)
+    ev_skew = calc_ev(p_skew, main_odds)
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Symmetric Over % (Naive)", f"{p_sym*100:.1f}%", f"EV: {ev_sym:+.1f}%")
+    s2.metric("Skewed Median (Typical Game)", f"{skew_median:.1f}", f"vs Mean {proj_mean:.1f}")
+    s3.metric("Right-Skewed Over % (Honest)", f"{p_skew*100:.1f}%", f"EV: {ev_skew:+.1f}%")
+    st.markdown("#### Fair Alternate Ladder (Compare Against DK & FD)")
+    step_size = 10.0 if proj_mean >= 40 else 5.0
+    base_rung = max(step_size, math.floor((proj_mean * 0.55) / step_size) * step_size) - 0.5
+    rungs = [base_rung + i * step_size for i in range(7)]
+    ladder_rows = []
+    for r in rungs:
+        p_r = 1.0 - norm.cdf(math.log(r), loc=mu, scale=sigma)
+        ladder_rows.append({
+            "Alt Line": f"{r + 0.5:.0f}+ ({r:.1f})",
+            "Skewed P(Over)": f"{p_r*100:.1f}%",
+            "Fair Over Odds": f"{prob_to_amer(p_r):+d}",
+            "Fair Under Odds": f"{prob_to_amer(1 - p_r):+d}",
+        })
+    st.dataframe(pd.DataFrame(ladder_rows), width="stretch")
+
+with tab4:
+    st.subheader("Promo Converter & Fractional Kelly Sizer")
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        st.markdown("##### Fractional Kelly Sizer")
+        k_prob = st.slider("Your True Win Prob (%)", 10, 90, 56) / 100.0
+        k_odds = st.number_input("Posted Odds", value=100, step=5)
+        kelly_frac = st.select_slider("Kelly Fraction", options=[0.25, 0.5, 1.0], value=0.25)
+        b = amer_to_dec(k_odds) - 1.0
+        full_k = max(0.0, (b * k_prob - (1.0 - k_prob)) / b)
+        rec_stake = round(total_roll * full_k * kelly_frac, 2)
+        st.metric("Recommended Stake", f"${rec_stake:.2f}", f"Full Kelly: {full_k*100:.2f}%")
+        if rec_stake > max_single_bet:
+            st.warning(f"Capped at 5% guardrail: **${max_single_bet:.2f}**")
+    with pc2:
+        st.markdown("##### Bonus Bet / Site Credit Hedge Converter")
+        promo_type = st.selectbox("Promo Type", ["Bonus Bet (Stake Not Returned)", "Site Credit (Stake Returned)"])
+        promo_amt = st.number_input("Promo Amount ($)", min_value=5.0, value=50.0, step=5.0)
+        promo_odds = st.number_input("Promo Side Odds (+)", min_value=100, value=300, step=10)
+        hedge_odds = st.number_input("Hedge Side Odds (-)", max_value=-100, value=-350, step=10)
+        p_dec = amer_to_dec(promo_odds)
+        h_dec = amer_to_dec(hedge_odds)
+        gross_win = promo_amt * (p_dec - 1.0) if "Bonus Bet" in promo_type else promo_amt * p_dec
+        hedge_stake = gross_win / h_dec
+        guaranteed_profit = gross_win - hedge_stake
+        conv_rate = (guaranteed_profit / promo_amt) * 100.0
+        st.metric("Hedge Stake Needed", f"${hedge_stake:.2f}")
+        st.metric("Guaranteed Cash Profit", f"${guaranteed_profit:.2f}", f"{conv_rate:.1f}% Conversion")
+
+with tab5:
+    st.subheader("Bet Log, Strategy ROI & Closing Line Value (CLV)")
+    if os.path.exists(LOG_FILE):
+        df_log = pd.read_csv(LOG_FILE)
+    else:
+        df_log = pd.DataFrame(columns=[
+            "Date", "Platform", "Strategy", "Pick", "Stake", "Odds", "Closing_Odds", "Result", "Profit", "CLV_Pct"
+        ])
+    with st.form("log_bet_form", clear_on_submit=True):
+        f1, f2, f3, f4 = st.columns(4)
+        b_date = f1.date_input("Date")
+        b_plat = f2.selectbox("Platform", ["FanDuel", "DraftKings", "PrizePicks", "Kalshi", "BetMGM", "Fanatics"])
+        b_strat = f3.selectbox("Strategy", ["Combos/Singles", "Alt Ladder", "5/6-Pick Flex", "Promo/Boost", "Neg-Corr SGP"])
+        b_pick = f4.text_input("Pick Description")
+        f5, f6, f7, f8 = st.columns(4)
+        b_stake = f5.number_input("Stake ($)", min_value=0.5, value=2.0, step=0.5)
+        b_odds = f6.number_input("Bet Odds", value=-110, step=5)
+        b_close = f7.number_input("Closing Odds (for CLV)", value=-115, step=5)
+        b_res = f8.selectbox("Result", ["Pending", "Win", "Loss", "Void"])
+        submitted = st.form_submit_button("Log Bet")
+        if submitted and b_pick:
+            profit = 0.0
+            if b_res == "Win":
+                profit = round(b_stake * (amer_to_dec(b_odds) - 1.0), 2)
+            elif b_res == "Loss":
+                profit = -b_stake
+            clv_pct = round((amer_to_prob(b_close) - amer_to_prob(b_odds)) * 100.0, 2)
+            new_row = pd.DataFrame([{
+                "Date": str(b_date), "Platform": b_plat, "Strategy": b_strat,
+                "Pick": b_pick, "Stake": b_stake, "Odds": b_odds,
+                "Closing_Odds": b_close, "Result": b_res, "Profit": profit, "CLV_Pct": clv_pct
+            }])
+            df_log = pd.concat([df_log, new_row], ignore_index=True)
+            df_log.to_csv(LOG_FILE, index=False)
+            st.success("Bet logged to bet_log.csv!")
+    if not df_log.empty:
+        settled = df_log[df_log["Result"].isin(["Win", "Loss"])]
+        tot_staked = settled["Stake"].sum()
+        tot_profit = settled["Profit"].sum()
+        roi = (tot_profit / tot_staked * 100.0) if tot_staked > 0 else 0.0
+        avg_clv = df_log["CLV_Pct"].mean()
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Net Profit", f"${tot_profit:+.2f}")
+        t2.metric("Overall ROI", f"{roi:+.1f}%")
+        t3.metric("Avg CLV", f"{avg_clv:+.2f}%")
+        st.dataframe(df_log, width="stretch")
