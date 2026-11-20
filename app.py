@@ -82,7 +82,13 @@ def load_local_cache_summary() -> list[dict[str, Any]]:
         if path.exists():
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-                count = len(raw) if isinstance(raw, list) else len(raw.keys()) if isinstance(raw, dict) else 1
+                count = (
+                    len(raw)
+                    if isinstance(raw, list)
+                    else len(raw.keys())
+                    if isinstance(raw, dict)
+                    else 1
+                )
                 summaries.append(
                     {
                         "file": path.name,
@@ -95,7 +101,9 @@ def load_local_cache_summary() -> list[dict[str, Any]]:
     return summaries
 
 
-def fetch_oddspapi_fixtures(api_key: str, sport: str = "basketball_nba") -> tuple[bool, Any]:
+def fetch_oddspapi_fixtures(
+    api_key: str, sport: str = "basketball_nba"
+) -> tuple[bool, Any]:
     url = "https://api.oddspapi.io/v4/fixtures"
     params = {"apiKey": api_key, "sport": sport}
     try:
@@ -139,7 +147,9 @@ def append_bet_log(row: dict[str, Any]) -> None:
 api_key = get_api_key()
 
 st.title("Asymmetric Betting Hub")
-st.caption("NBA Cup Slate · Friday, Nov 20, 2026 · 80% Floor Engine · Layer 3 Skew Ladder · Fractional Kelly")
+st.caption(
+    "NBA Cup Slate · Friday, Nov 20, 2026 · 80% Floor Engine · Layer 3 Skew Ladder · Fractional Kelly"
+)
 
 with st.sidebar:
     st.header("Bankroll & Risk Controls")
@@ -150,21 +160,41 @@ with st.sidebar:
         step=0.50,
         format="%.2f",
     )
-    max_cap_pct = st.slider("Max Single-Ticket Cap (%)", min_value=1.0, max_value=10.0, value=MAX_BET_PCT * 100, step=0.5)
+    max_cap_pct = st.slider(
+        "Max Single-Ticket Cap (%)",
+        min_value=1.0,
+        max_value=10.0,
+        value=MAX_BET_PCT * 100,
+        step=0.5,
+    )
     max_bet_cap = round(bankroll * (max_cap_pct / 100.0), 2)
-    kelly_frac = st.selectbox("Fractional Kelly", options=[0.10, 0.25, 0.50, 1.0], index=1, format_func=lambda x: f"{int(x*100)}% Kelly")
+    kelly_frac = st.selectbox(
+        "Fractional Kelly",
+        options=[0.10, 0.25, 0.50, 1.0],
+        index=1,
+        format_func=lambda x: f"{int(x * 100)}% Kelly",
+    )
 
     st.metric("Max Single Ticket", f"${max_bet_cap:.2f}")
 
     st.divider()
     st.subheader("OddsPapi Connection")
     if api_key:
-        st.success(f"API Key Loaded ({api_key[:4]}...{api_key[-4:]})" if len(api_key) >= 8 else "API Key Loaded")
+        st.success(
+            f"API Key Loaded ({api_key[:4]}...{api_key[-4:]})"
+            if len(api_key) >= 8
+            else "API Key Loaded"
+        )
     else:
         st.warning("No ODDSPAPI_API_KEY found in Streamlit Secrets or .env")
 
 tab_engine, tab_ladder, tab_scanner, tab_log = st.tabs(
-    ["80% Floor & Kelly Sizer", "Layer 3 Skew / Alt Ladder", "OddsPapi & Cache Scanner", "ROI & Bet Log"]
+    [
+        "80% Floor & Kelly Sizer",
+        "Layer 3 Skew / Alt Ladder",
+        "OddsPapi & Cache Scanner",
+        "ROI & Bet Log",
+    ]
 )
 
 with tab_engine:
@@ -172,9 +202,17 @@ with tab_engine:
     col1, col2, col3 = st.columns(3)
     with col1:
         market_label = st.text_input("Player / Market", value="NBA Cup Player Prop")
-        est_floor_prob = st.slider("Estimated Floor Hit Prob (%)", min_value=50.0, max_value=99.0, value=82.0, step=0.5)
+        est_floor_prob = st.slider(
+            "Estimated Floor Hit Prob (%)",
+            min_value=50.0,
+            max_value=99.0,
+            value=82.0,
+            step=0.5,
+        )
     with col2:
-        american_odds = st.number_input("American Odds", min_value=-2000, max_value=2000, value=-220, step=5)
+        american_odds = st.number_input(
+            "American Odds", min_value=-2000, max_value=2000, value=-220, step=5
+        )
         slate_label = st.text_input("Slate", value="NBA Cup Fri 2026-11-20")
     with col3:
         implied_prob = american_to_implied_prob(float(american_odds)) * 100.0
@@ -192,9 +230,13 @@ with tab_engine:
         st.metric("Recommended Stake", f"${rec_stake:.2f}")
 
     if passes_floor:
-        st.success(f"PASSES 80% FLOOR ({est_floor_prob:.1f}% >= 80.0%) · Full Kelly: {full_kelly_pct:.1f}%")
+        st.success(
+            f"PASSES 80% FLOOR ({est_floor_prob:.1f}% >= 80.0%) · Full Kelly: {full_kelly_pct:.1f}%"
+        )
     else:
-        st.error(f"BELOW 80% FLOOR ({est_floor_prob:.1f}% < 80.0%) · Pass or lower alt line")
+        st.error(
+            f"BELOW 80% FLOOR ({est_floor_prob:.1f}% < 80.0%) · Pass or lower alt line"
+        )
 
     if st.button("Log Candidate to Bet Tracker", type="primary"):
         append_bet_log(
@@ -214,14 +256,20 @@ with tab_engine:
 
 with tab_ladder:
     st.subheader("Layer 3 Skew / Alt Ladder")
-    base_line = st.number_input("Base Projection / Line", min_value=0.5, max_value=100.0, value=20.0, step=0.5)
-    step_size = st.number_input("Ladder Step Increment", min_value=0.5, max_value=25.0, value=2.5, step=0.5)
+    base_line = st.number_input(
+        "Base Projection / Line", min_value=0.5, max_value=100.0, value=20.0, step=0.5
+    )
+    step_size = st.number_input(
+        "Ladder Step Increment", min_value=0.5, max_value=25.0, value=2.5, step=0.5
+    )
     ladder_rows = []
     for idx, mult in enumerate([0.75, 0.85, 0.95, 1.0, 1.10], start=1):
         alt_line = round(max(0.5, base_line * mult), 1)
         alt_odds = -260 if mult <= 0.85 else (-160 if mult <= 1.0 else +135)
         est_p = min(95.0, max(35.0, 88.0 - (idx - 1) * 11.0))
-        stake_val, _ = fractional_kelly_stake(est_p / 100.0, alt_odds, bankroll, kelly_frac, max_bet_cap)
+        stake_val, _ = fractional_kelly_stake(
+            est_p / 100.0, alt_odds, bankroll, kelly_frac, max_bet_cap
+        )
         ladder_rows.append(
             {
                 "Rung": f"Rung {idx}",
@@ -258,4 +306,26 @@ with tab_log:
     st.subheader("ROI & Bet Log")
     log_df = load_bet_log()
     if log_df.empty:
-        st.info("No logged bets
+        st.info(
+            "No logged bets yet. Use 'Log Candidate to Bet Tracker' to record entries."
+        )
+    else:
+        total_staked = (
+            pd.to_numeric(log_df["stake_usd"], errors="coerce").fillna(0.0).sum()
+        )
+        st.metric("Total Logged Stake", f"${total_staked:.2f}")
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+Commit and push app.py in PowerShell: Run this inside C:\Users\ricky\OneDrive\Desktop\Smart Bets:   
+Windows PowerShell.jpg
+
+PowerShell
+python -m py_compile app.py
+git add app.py
+git commit -m "Fix truncated string literal in app.py"
+git push
+Verification: py_compile exits with zero output/errors, and git push updates main on SaxmanR3/asymmetric-betting-hub.
+
+Reload your app tab: Press Ctrl + Shift + R on r9nz3qtxzofafgr5jqca27.streamlit.app (or click ⋮ -> Rerun in the app menu).
+Verification: The Script execution error modal disappears and the Asymmetric Betting Hub title, sidebar ($54.92 bankroll / $2.75 max ticket), and four tabs render cleanly.   
+Streamlit - Google Chrome.png
++ 1
