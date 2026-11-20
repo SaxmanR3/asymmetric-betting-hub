@@ -40,6 +40,15 @@ LOG_COLUMNS = [
     "CLV_Pct",
 ]
 
+DEFAULT_BALANCES = {
+    "DraftKings": 40.12,
+    "FanDuel": 14.80,
+    "PrizePicks": 0.00,
+    "Kalshi": 0.00,
+    "BetMGM": 0.00,
+    "Fanatics": 0.00,
+}
+
 PLATFORMS = ["FanDuel", "DraftKings", "PrizePicks", "Kalshi", "BetMGM", "Fanatics"]
 STRATEGIES = [
     "Combos/Singles",
@@ -83,14 +92,15 @@ PRIORITY_BOOKS = [
 ]
 
 DEFAULT_SPORTS = {
-    "NFL": {"sportId": 14, "filter": "nfl"},
-    "NCAAF": {"sportId": 14, "filter": "ncaaf"},
     "NBA": {"sportId": 11, "filter": "nba"},
-    "MLS": {"sportId": 10, "filter": "mls"},
-    "MLB": {"sportId": 13, "filter": "mlb"},
-    "WNBA": {"sportId": 11, "filter": "wnba"},
+    "NFL": {"sportId": 14, "filter": "nfl"},
+    "NHL": {"sportId": 16, "filter": "nhl"},
+    "NCAAF": {"sportId": 14, "filter": "ncaaf"},
     "NCAAM": {"sportId": 11, "filter": "ncaam"},
     "NCAAW": {"sportId": 11, "filter": "ncaaw"},
+    "WNBA": {"sportId": 11, "filter": "wnba"},
+    "MLB": {"sportId": 13, "filter": "mlb"},
+    "MLS": {"sportId": 10, "filter": "mls"},
     "Tennis": {"sportId": 12, "filter": ""},
     "Boxing": {"sportId": 21, "filter": ""},
 }
@@ -121,17 +131,12 @@ SD_MULTIPLIERS = {
     "Custom / Game-Log Driven": 0.45,
 }
 
-DEFAULT_BALANCES = {
-    "DraftKings": 40.12,
-    "FanDuel": 14.80,
-    "PrizePicks": 0.00,
-    "Kalshi": 0.00,
-    "BetMGM": 0.00,
-    "Fanatics": 0.00,
-}
-
 st.set_page_config(page_title="Asymmetric Betting Hub", layout="wide")
 st.title("Asymmetric Betting Hub")
+st.caption(
+    "Data-First Flow: **1) Injury & Watchlist Pull** -> **2) OddsPapi Fixture & Odds Pull** -> "
+    "**3) Edge / Skew / Combo Pricing** -> **4) Bet Log & Bankroll Sync**"
+)
 
 
 # --- CORE MATH HELPERS ---
@@ -200,6 +205,18 @@ def fmt_book(slug: str) -> str:
     return BOOK_LABELS.get(slug.lower(), slug.title())
 
 
+def get_restricted_players() -> List[str]:
+    raw = st.session_state.get("restricted_players_raw", "")
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
+def find_roster_conflicts(text: str) -> List[str]:
+    if not text:
+        return []
+    lower_text = text.lower()
+    return [p for p in get_restricted_players() if p in lower_text]
+
+
 def matches_league(fx: dict, league_filter: str) -> bool:
     if not league_filter:
         return True
@@ -235,24 +252,9 @@ def matches_league(fx: dict, league_filter: str) -> bool:
     return league_filter in blob
 
 
-# --- AUTOMATED ROSTER & INJURY WATCHLIST ---
-def get_restricted_players() -> List[str]:
-    raw = st.session_state.get("restricted_players_raw", "")
-    return [p.strip() for p in raw.split(",") if p.strip()]
-
-
-def find_roster_conflicts(pick_text: str) -> List[str]:
-    if not pick_text:
-        return []
-    lower_pick = pick_text.lower()
-    return [p for p in get_restricted_players() if p.lower() in lower_pick]
-
-
-# --- PERSISTENT BET LOG & BANKROLL AUTO-SYNC ---
-def init_bankroll_state() -> None:
-    for plat, default_val in DEFAULT_BALANCES.items():
-        if f"bal_{plat}" not in st.session_state:
-            st.session_state[f"bal_{plat}"] = default_val
+# --- BANKROLL OFFSET HELPERS ---
+def init_bankroll_offsets() -> None:
+    for plat in DEFAULT_BALANCES:
         if f"bal_adj_{plat}" not in st.session_state:
             st.session_state[f"bal_adj_{plat}"] = 0.0
     if "auto_sync_bankroll" not in st.session_state:
@@ -262,12 +264,12 @@ def init_bankroll_state() -> None:
 def apply_bankroll_delta(plat: str, delta: float) -> None:
     if not st.session_state.get("auto_sync_bankroll", True):
         return
-    matched_plat = next((p for p in PLATFORMS if p.lower() == plat.lower()), None)
-    if matched_plat:
-        adj_key = f"bal_adj_{matched_plat}"
-        st.session_state[adj_key] = round(float(st.session_state.get(adj_key, 0.0)) + delta, 2)
+    if plat in DEFAULT_BALANCES:
+        key = f"bal_adj_{plat}"
+        st.session_state[key] = round(float(st.session_state.get(key, 0.0)) + delta, 2)
 
 
+# --- PERSISTENT BET LOG ENGINE ---
 def get_bet_log() -> pd.DataFrame:
     if "bet_log_df" not in st.session_state:
         if os.path.exists(LOG_FILE):
@@ -329,13 +331,12 @@ def append_bet_record(
         columns=LOG_COLUMNS,
     )
     save_bet_log(pd.concat([df, new_row], ignore_index=True))
-
     if res == "Pending":
-        apply_bankroll_delta(plat, -float(stake))
+        apply_bankroll_delta(plat, -round(float(stake), 2))
     elif res == "Win":
-        apply_bankroll_delta(plat, profit)
-    elif res == "Loss":
-        apply_bankroll_delta(plat, -float(stake))
+        apply_bankroll_delta(plat, round(profit, 2))
+    elif res in ("Push", "Void"):
+        apply_bankroll_delta(plat, 0.0)
 
 
 def parse_and_import_csv_lines(raw_text: str) -> Tuple[int, List[str]]:
@@ -363,12 +364,6 @@ def parse_and_import_csv_lines(raw_text: str) -> Tuple[int, List[str]]:
             if not pick:
                 errors.append(f"Line {line_no}: Pick Description is empty.")
                 continue
-            conflicts = find_roster_conflicts(pick)
-            if conflicts:
-                errors.append(
-                    f"Line {line_no} ({pick}): blocked by Restricted Roster Watchlist ({', '.join(conflicts)})."
-                )
-                continue
             stake = float(parts[-4].strip().replace("$", ""))
             odds = int(round(float(parts[-3].strip().replace("+", ""))))
             close_raw = parts[-2].strip().replace("+", "")
@@ -388,7 +383,7 @@ def render_quick_paste_csv(key_prefix: str) -> None:
     p_col1, p_col2 = st.columns([4.2, 1.0])
     pasted = p_col1.text_area(
         "Paste CSV rows",
-        placeholder="2026-11-20,DraftKings,+EV Straight,Derrick Henry Over 70.5 Rush Yds,2.00,-114,-114,Pending",
+        placeholder="2026-11-20,FanDuel,Combos/Singles,Scottie Barnes Alt Points Floor (TOR @ DET),2.00,-115,-115,Pending",
         height=68,
         label_visibility="collapsed",
         key=f"{key_prefix}_csv_paste",
@@ -447,12 +442,12 @@ def render_inline_bet_logger(
                     st.warning("Enter a Pick Description before logging.")
                 elif conflicts:
                     st.error(
-                        f"ROSTER BLOCK: '{', '.join(conflicts)}' is on your Restricted/Injury Watchlist."
+                        f"ROSTER CONFLICT: '{b_pick.strip()}' matches watchlist player(s): {', '.join(conflicts).title()}."
                     )
                 else:
                     if max_single_cap > 0 and b_stake > max_single_cap:
                         st.warning(
-                            f"Stake ${b_stake:.2f} exceeds 5% cap (${max_single_cap:.2f}); logged for tracking."
+                            f"Stake ${b_stake:.2f} exceeds 5% cap (${max_single_cap:.2f}); logged anyway for tracking."
                         )
                     append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
                     st.success(f"Logged: {b_pick.strip()} (${b_stake:.2f} @ {int(b_odds):+d}) on {b_plat}")
@@ -516,6 +511,41 @@ def load_market_catalog(sport_id: int) -> Dict[str, dict]:
 
     st.session_state[cache_key] = catalog
     return catalog
+
+
+def pull_upcoming_fixtures(selected_sport: str) -> None:
+    if not API_KEY:
+        st.error("Add ODDSPAPI_API_KEY to your .env file or Streamlit secrets first.")
+        return
+    today = date.today()
+    cfg = st.session_state["sport_map"][selected_sport]
+    params = {
+        "apiKey": API_KEY,
+        "sportId": cfg["sportId"],
+        "from": today.isoformat(),
+        "to": (today + timedelta(days=7)).isoformat(),
+        "hasOdds": "true",
+    }
+    try:
+        r = requests.get(f"{BASE_URL}/fixtures", params=params, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            raw_fixtures = data if isinstance(data, list) else data.get("fixtures", [])
+            league_filter = cfg.get("filter", "")
+            fixtures = [fx for fx in raw_fixtures if matches_league(fx, league_filter)]
+            st.session_state["fixtures"] = fixtures
+            st.session_state["fixtures_sport_id"] = cfg["sportId"]
+            st.session_state["fixtures_sport_label"] = selected_sport
+            if fixtures:
+                st.success(f"Loaded {len(fixtures)} upcoming {selected_sport} games.")
+            else:
+                st.warning(
+                    f"No upcoming {selected_sport} games found in the next 7 days."
+                )
+        else:
+            st.error(f"API Error {r.status_code}: {r.text[:250]}")
+    except Exception as exc:
+        st.error(f"Connection error: {exc}")
 
 
 def parse_american_price(node: dict) -> Optional[int]:
@@ -672,29 +702,36 @@ def scan_fixture_ev(
     return ev_rows, pp_rows
 
 
-init_bankroll_state()
+init_bankroll_offsets()
+if "sport_map" not in st.session_state:
+    st.session_state["sport_map"] = dict(DEFAULT_SPORTS)
+if "restricted_players_raw" not in st.session_state:
+    st.session_state["restricted_players_raw"] = ""
 
-# --- SIDEBAR: LIVE BANKROLL & EXPOSURE ---
+
+# --- SIDEBAR: BANKROLL, UNIT CAP & DATA SYNC ---
 with st.sidebar:
     st.header("Bankroll & Unit Rules")
-    base_bals: Dict[str, float] = {}
-    adj_bals: Dict[str, float] = {}
-    for plat in PLATFORMS:
-        base_val = st.number_input(
+    st.checkbox("Auto-sync balances on log/settle", key="auto_sync_bankroll")
+
+    live_balances: Dict[str, float] = {}
+    for plat, base_val in DEFAULT_BALANCES.items():
+        adj = float(st.session_state.get(f"bal_adj_{plat}", 0.0)) if st.session_state["auto_sync_bankroll"] else 0.0
+        val = st.number_input(
             f"{plat} ($)",
             min_value=0.0,
+            value=round(base_val + adj, 2),
             step=1.0,
             key=f"bal_{plat}",
         )
-        adj_val = float(st.session_state.get(f"bal_adj_{plat}", 0.0))
-        base_bals[plat] = base_val
-        adj_bals[plat] = adj_val
+        live_balances[plat] = float(val)
 
-    st.checkbox(
-        "Auto-sync balances on log/settle",
-        key="auto_sync_bankroll",
-        help="Tracks ledger cash adjustments separately from base inputs to avoid widget state errors.",
-    )
+    total_roll = sum(live_balances.values())
+    st.metric("Total Active Roll", f"${total_roll:,.2f}")
+
+    unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
+    max_single_bet = round(total_roll * 0.05, 2)
+    st.caption(f"5% Max Single-Ticket Cap: **${max_single_bet:.2f}**")
 
     df_side = get_bet_log()
     pending_risk = (
@@ -702,28 +739,6 @@ with st.sidebar:
         if not df_side.empty
         else 0.0
     )
-
-    sync_active = st.session_state.get("auto_sync_bankroll", True)
-    liquid_roll = round(
-        sum(
-            max(0.0, base_bals[p] + (adj_bals[p] if sync_active else 0.0))
-            for p in PLATFORMS
-        ),
-        2,
-    )
-    total_roll = round(liquid_roll + pending_risk, 2)
-
-    st.metric("Total Active Roll", f"${total_roll:,.2f}", f"Liquid: ${liquid_roll:,.2f}")
-    if sync_active and any(abs(adj_bals[p]) > 1e-6 for p in PLATFORMS):
-        adj_summary = ", ".join(
-            f"{p}: {adj_bals[p]:+.2f}" for p in PLATFORMS if abs(adj_bals[p]) > 1e-6
-        )
-        st.caption(f"Ledger Cash Deltas: {adj_summary}")
-
-    unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
-    max_single_bet = round(total_roll * 0.05, 2)
-    st.caption(f"5% Max Single-Ticket Cap: **${max_single_bet:.2f}**")
-
     st.metric(
         "Pending Risk Exposure",
         f"${pending_risk:,.2f}",
@@ -737,112 +752,42 @@ with st.sidebar:
         st.warning("No ODDSPAPI_API_KEY found")
 
 
-# --- 5 MAIN TABS ---
+# --- STAGE 1: DATA PULLS & WATCHLIST (FIRST IN FLOW) ---
+with st.expander("Stage 1: Injury Watchlist & OddsPapi Data Pulls (Run Before Pricing)", expanded=True):
+    st.text_input(
+        "Flagged / Out / Doubtful / Questionable Players (comma-separated, auto-blocks conflicts)",
+        placeholder="e.g., Kawhi Leonard, Tyrese Haliburton, Chet Holmgren, Kenneth Walker III",
+        key="restricted_players_raw",
+    )
+    d1, d2, d3 = st.columns([1.4, 1.8, 1.3])
+    stage1_sport = d1.selectbox("Sport / League", list(st.session_state["sport_map"].keys()), key="stage1_sport")
+    if d2.button("Pull Upcoming Fixtures (1 API Credit)", key="stage1_pull_fx", use_container_width=True):
+        pull_upcoming_fixtures(stage1_sport)
+    fx_count = len(st.session_state.get("fixtures", []))
+    d3.metric("Loaded Fixtures", f"{fx_count}", st.session_state.get("fixtures_sport_label", stage1_sport))
+
+
+# --- 5 FLOW-ORDERED TABS ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
-        "1. Combos & Singles",
-        "2. PrizePicks & +EV Scanner",
-        "3. Layer 3 Skew & Alt Ladder",
+        "1. OddsPapi & +EV Scanner",
+        "2. Skew & Alt Ladder",
+        "3. Combos & Singles",
         "4. Promo & Bankroll Guardrails",
         "5. ROI & CLV Tracker",
     ]
 )
 
 # ==========================================
-# TAB 1: COMBOS & SINGLES (PER-LEG GUARDRAIL)
+# TAB 1: ODDSPAPI & +EV SCANNER
 # ==========================================
 with tab1:
-    st.subheader("Combos & Singles Guardrail (Per-Leg Hit Rate)")
-    st.caption(
-        "Score each floor leg individually (PA / PRA / Rush+Rec) | "
-        "80% single BE: **-400** | 2x 80%: **-178** | 3x 80%: **-105**"
-    )
-
-    st.text_input(
-        "Automated Roster Watchlist — Flagged / Out / Doubtful / Questionable Players (comma-separated)",
-        placeholder="Paste today's OUT / Q names from Gemini check (e.g., Kawhi Leonard, Tyrese Haliburton)",
-        key="restricted_players_raw",
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        num_legs = st.radio("Number of Floor Legs", [1, 2, 3], horizontal=True, index=2)
-        p1 = st.slider("Leg 1 Hit Rate (%)", 55, 95, 80) / 100.0
-        p2 = (st.slider("Leg 2 Hit Rate (%)", 55, 95, 80) / 100.0) if num_legs >= 2 else 1.0
-        p3 = (st.slider("Leg 3 Hit Rate (%)", 55, 95, 80) / 100.0) if num_legs >= 3 else 1.0
-    with c2:
-        t1_plat = st.selectbox("Target Book", PLATFORMS, index=0, key="t1_plat_pick")
-        posted_odds = st.number_input("Posted Ticket Odds (American)", value=-115, step=5)
-        t1_desc = st.text_input(
-            "Combo / Single Description (auto-fills Bet Log)",
-            placeholder="e.g., Henry 50+ Rush / Lamb 5+ Rec / Pollard 40+ Rush",
-        )
-        injury_clear = st.checkbox(
-            "All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False
-        )
-
-        with st.expander("Official Injury Report Quick Links"):
-            st.markdown(
-                "- [NFL Official Injury Report](https://www.nfl.com/injuries/)\n"
-                "- [NBA Official Injury Report](https://official.nba.com/nba-injury-report-2025-26-season/)\n"
-                "- [ESPN College Football Injuries](https://www.espn.com/college-football/injuries)\n"
-                "- [ESPN College Basketball Injuries](https://www.espn.com/mens-college-basketball/injuries)"
-            )
-
-    comb_prob = p1 * p2 * p3
-    fair_odds = prob_to_amer(comb_prob)
-    ev_pct = calc_ev(comb_prob, posted_odds)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Combined Hit Rate", f"{comb_prob*100:.1f}%")
-    m2.metric("Fair Breakeven Odds", f"{fair_odds:+d}")
-    m3.metric("Estimated EV", f"{ev_pct:+.1f}%")
-
-    straight_stake = min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size
-    kicker_stake = (
-        min(round(straight_stake * 0.25, 2), max_single_bet)
-        if max_single_bet > 0
-        else round(straight_stake * 0.25, 2)
-    )
-
-    t1_conflicts = find_roster_conflicts(t1_desc)
-    if t1_conflicts:
-        st.error(
-            f"ROSTER CONFLICT: Slip mentions flagged/inactive player(s): **{', '.join(t1_conflicts)}**. Remove before firing."
-        )
-    elif not injury_clear:
-        st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
-    elif ev_pct < 0:
-        st.warning(
-            f"JUICE LEAK: Posted {posted_odds:+d} is worse than your fair price ({fair_odds:+d}). Shop books or pass."
-        )
-    else:
-        st.success(
-            f"GREEN LIGHT (+{ev_pct:.1f}% EV). Singles-First Split: **${straight_stake:.2f}** per straight + **${kicker_stake:.2f}** combo kicker."
-        )
-
-    render_inline_bet_logger(
-        key_prefix="tab1",
-        max_single_cap=max_single_bet,
-        default_plat=t1_plat,
-        default_strat="Combos/Singles",
-        default_pick=t1_desc,
-        default_stake=kicker_stake if num_legs > 1 else straight_stake,
-        default_odds=int(posted_odds),
-    )
-
-# ==========================================
-# TAB 2: PRIZEPICKS & +EV SCANNER (ODDSPAPI)
-# ==========================================
-with tab2:
     st.subheader("Live OddsPapi Feed + Auto Split-Devig & PrizePicks Scanner")
     st.caption(
         "Main Lines -> Devig to **Pinnacle** | Player Props -> Devig to **FanDuel** | "
         "PP 5-Flex BE: **54.25% (-119)** | 6-Flex BE: **54.21% (-118)**"
     )
 
-    if "sport_map" not in st.session_state:
-        st.session_state["sport_map"] = dict(DEFAULT_SPORTS)
     if "t2_width_input" not in st.session_state:
         st.session_state["t2_width_input"] = 25
     if "t2_ev_input" not in st.session_state:
@@ -876,7 +821,7 @@ with tab2:
         st.rerun()
 
     col_a, col_b, col_c = st.columns(3)
-    selected_sport = col_a.selectbox("Sport / League", list(st.session_state["sport_map"].keys()))
+    selected_sport = col_a.selectbox("Sport / League", list(st.session_state["sport_map"].keys()), key="t1_scan_sport")
     max_width = col_b.number_input(
         "Max Market Width (cents)",
         min_value=5,
@@ -899,38 +844,8 @@ with tab2:
     )
 
     b1, b2 = st.columns([2, 1])
-    if b1.button("Pull Upcoming Fixtures (1 API Credit)"):
-        if not API_KEY:
-            st.error("Add ODDSPAPI_API_KEY to your .env file or Streamlit secrets first.")
-        else:
-            today = date.today()
-            cfg = st.session_state["sport_map"][selected_sport]
-            params = {
-                "apiKey": API_KEY,
-                "sportId": cfg["sportId"],
-                "from": today.isoformat(),
-                "to": (today + timedelta(days=7)).isoformat(),
-                "hasOdds": "true",
-            }
-            try:
-                r = requests.get(f"{BASE_URL}/fixtures", params=params, timeout=15)
-                if r.status_code == 200:
-                    data = r.json()
-                    raw_fixtures = data if isinstance(data, list) else data.get("fixtures", [])
-                    league_filter = cfg.get("filter", "")
-                    fixtures = [fx for fx in raw_fixtures if matches_league(fx, league_filter)]
-                    st.session_state["fixtures"] = fixtures
-                    st.session_state["fixtures_sport_id"] = cfg["sportId"]
-                    if fixtures:
-                        st.success(f"Loaded {len(fixtures)} upcoming {selected_sport} games.")
-                    else:
-                        st.warning(
-                            f"No upcoming {selected_sport} games found in the next 7 days (offseason or lines not posted yet)."
-                        )
-                else:
-                    st.error(f"API Error {r.status_code}: {r.text[:250]}")
-            except Exception as exc:
-                st.error(f"Connection error: {exc}")
+    if b1.button("Pull Upcoming Fixtures (1 API Credit)", key="t1_pull_fx"):
+        pull_upcoming_fixtures(selected_sport)
 
     if b2.button("Load All Sports (UFC/Golf/etc.)"):
         if not API_KEY:
@@ -954,10 +869,10 @@ with tab2:
             except Exception as exc:
                 st.error(f"Connection error: {exc}")
 
-    t2_prefill_plat = "DraftKings"
-    t2_prefill_strat = "+EV Straight"
-    t2_prefill_pick = ""
-    t2_prefill_odds = -110
+    t1_prefill_plat = "DraftKings"
+    t1_prefill_strat = "+EV Straight"
+    t1_prefill_pick = ""
+    t1_prefill_odds = -110
 
     if "fixtures" in st.session_state and st.session_state["fixtures"]:
         search_txt = st.text_input("Filter by Team (optional, 0 credits)", value="").strip().lower()
@@ -1037,14 +952,14 @@ with tab2:
                     format_func=lambda i: ev_choices[i],
                 )
                 picked_row = ev_rows[chosen_ev_idx]
-                t2_prefill_plat = (
+                t1_prefill_plat = (
                     picked_row["Book"] if picked_row["Book"] in PLATFORMS else "DraftKings"
                 )
-                t2_prefill_strat = "+EV Straight"
-                t2_prefill_pick = (
+                t1_prefill_strat = "+EV Straight"
+                t1_prefill_pick = (
                     f"{picked_row['Market']}: {picked_row['Selection']} ({scan_game.split('(')[0].strip()})"
                 )
-                t2_prefill_odds = picked_row["Book_Odds_Int"]
+                t1_prefill_odds = picked_row["Book_Odds_Int"]
             else:
                 st.info(
                     f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on "
@@ -1065,28 +980,16 @@ with tab2:
                 )
                 if st.checkbox("Use selected PrizePicks prop in Bet Log below", value=False):
                     pp_r = pp_rows[chosen_pp_idx]
-                    t2_prefill_plat = "PrizePicks"
-                    t2_prefill_strat = "5/6-Pick Flex"
-                    t2_prefill_pick = (
+                    t1_prefill_plat = "PrizePicks"
+                    t1_prefill_strat = "5/6-Pick Flex"
+                    t1_prefill_pick = (
                         f"PP Flex: {pp_r['Player']} — {pp_r['Market']} ({pp_r['Side']})"
                     )
-                    t2_prefill_odds = -118
+                    t1_prefill_odds = -118
             else:
                 st.info(
                     f"No two-way player props cleared 54.21% true probability under {max_width}c width yet."
                 )
-
-            with st.expander("View Active Books & Market Counts"):
-                norm_map = {str(k).lower(): v for k, v in b_odds.items()}
-                ordered_books = key_books + [b for b in norm_map.keys() if b not in key_books]
-                summary_rows = [
-                    {
-                        "Bookmaker": fmt_book(bk),
-                        "Active Markets": len(norm_map[bk].get("markets", {})),
-                    }
-                    for bk in ordered_books[:20]
-                ]
-                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("#### Quick Manual Devig & PrizePicks Edge Checker (0 API Credits)")
@@ -1119,19 +1022,19 @@ with tab2:
         )
 
     render_inline_bet_logger(
-        key_prefix="tab2",
+        key_prefix="tab1_scanner",
         max_single_cap=max_single_bet,
-        default_plat=t2_prefill_plat,
-        default_strat=t2_prefill_strat,
-        default_pick=t2_prefill_pick,
+        default_plat=t1_prefill_plat,
+        default_strat=t1_prefill_strat,
+        default_pick=t1_prefill_pick,
         default_stake=min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size,
-        default_odds=t2_prefill_odds,
+        default_odds=t1_prefill_odds,
     )
 
 # ==========================================
-# TAB 3: LAYER 3 SKEW & ALT LADDER
+# TAB 2: SKEW & ALT LADDER
 # ==========================================
-with tab3:
+with tab2:
     st.subheader("Layer 3: Log-Normal Right Skew & Alt-Ladder Pricer")
     lc1, lc2 = st.columns(2)
     with lc1:
@@ -1201,23 +1104,95 @@ with tab3:
         "Select Rung to Pre-Fill Bet Log", [row["Alt Line"] for row in ladder_rows], index=2
     )
     p_prefix = f"{player_label.strip()} " if player_label.strip() else ""
-    t3_pick = f"{p_prefix}{selected_rung} {prop_type}".strip()
+    t2_pick = f"{p_prefix}{selected_rung} {prop_type}".strip()
+    conflicts_t2 = find_roster_conflicts(t2_pick)
+    if conflicts_t2:
+        st.error(f"ROSTER CONFLICT: Watchlist match for {', '.join(conflicts_t2).title()}.")
 
     render_inline_bet_logger(
-        key_prefix="tab3",
+        key_prefix="tab2_skew",
         max_single_cap=max_single_bet,
         default_plat="DraftKings",
         default_strat="Alt Ladder",
-        default_pick=t3_pick,
+        default_pick=t2_pick,
         default_stake=min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size,
         default_odds=int(main_odds),
+    )
+
+# ==========================================
+# TAB 3: COMBOS & SINGLES
+# ==========================================
+with tab3:
+    st.subheader("Combos & Singles Guardrail (Per-Leg Hit Rate)")
+    st.caption(
+        "Score each floor leg individually (PA / PRA / Rush+Rec) | "
+        "80% single BE: **-400** | 2x 80%: **-178** | 3x 80%: **-105**"
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        num_legs = st.radio("Number of Floor Legs", [1, 2, 3], horizontal=True, index=2)
+        p1 = st.slider("Leg 1 Hit Rate (%)", 55, 95, 80) / 100.0
+        p2 = (st.slider("Leg 2 Hit Rate (%)", 55, 95, 80) / 100.0) if num_legs >= 2 else 1.0
+        p3 = (st.slider("Leg 3 Hit Rate (%)", 55, 95, 80) / 100.0) if num_legs >= 3 else 1.0
+    with c2:
+        t3_plat = st.selectbox("Target Book", PLATFORMS, index=0, key="t3_plat_pick")
+        posted_odds = st.number_input("Posted Ticket Odds (American)", value=-115, step=5)
+        t3_desc = st.text_input(
+            "Combo / Single Description (auto-fills Bet Log)",
+            placeholder="e.g., Scottie Barnes Alt Points Floor (TOR @ DET)",
+        )
+        injury_clear = st.checkbox(
+            "All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False
+        )
+
+    conflicts_t3 = find_roster_conflicts(t3_desc)
+    comb_prob = p1 * p2 * p3
+    fair_odds = prob_to_amer(comb_prob)
+    ev_pct = calc_ev(comb_prob, posted_odds)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Combined Hit Rate", f"{comb_prob*100:.1f}%")
+    m2.metric("Fair Breakeven Odds", f"{fair_odds:+d}")
+    m3.metric("Estimated EV", f"{ev_pct:+.1f}%")
+
+    straight_stake = min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size
+    kicker_stake = (
+        min(round(straight_stake * 0.25, 2), max_single_bet)
+        if max_single_bet > 0
+        else round(straight_stake * 0.25, 2)
+    )
+
+    if conflicts_t3:
+        st.error(
+            f"GATE LOCKED — ROSTER CONFLICT: Description matches watchlist player(s): {', '.join(conflicts_t3).title()}."
+        )
+    elif not injury_clear:
+        st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
+    elif ev_pct < 0:
+        st.warning(
+            f"JUICE LEAK: Posted {posted_odds:+d} is worse than your fair price ({fair_odds:+d}). Shop books or pass."
+        )
+    else:
+        st.success(
+            f"GREEN LIGHT (+{ev_pct:.1f}% EV). Singles-First Split: **${straight_stake:.2f}** per straight + **${kicker_stake:.2f}** combo kicker."
+        )
+
+    render_inline_bet_logger(
+        key_prefix="tab3_combos",
+        max_single_cap=max_single_bet,
+        default_plat=t3_plat,
+        default_strat="Combos/Singles",
+        default_pick=t3_desc,
+        default_stake=kicker_stake if num_legs > 1 else straight_stake,
+        default_odds=int(posted_odds),
     )
 
 # ==========================================
 # TAB 4: PROMO & BANKROLL GUARDRAILS
 # ==========================================
 with tab4:
-    st.subheader("Promo Converter, Token Eligibility & Fractional Kelly Sizer")
+    st.subheader("Promo Converter & Fractional Kelly Sizer")
     pc1, pc2 = st.columns(2)
     with pc1:
         st.markdown("##### Fractional Kelly Sizer")
@@ -1250,58 +1225,13 @@ with tab4:
         st.metric("Hedge Stake Needed", f"${hedge_stake:.2f}")
         st.metric("Guaranteed Cash Profit", f"${guaranteed_profit:.2f}", f"{conv_rate:.1f}% Conversion")
 
-    st.divider()
-    st.markdown("##### Automated Promo & Boost Eligibility Guardrail")
-    eg1, eg2, eg3, eg4 = st.columns(4)
-    token_kind = eg1.selectbox(
-        "Token Type",
-        ["Profit Boost", "SGP Profit Boost", "Bonus Bet (SNR)", "Bet Reset / No Sweat", "Early Win Token"],
-    )
-    min_req_odds = eg2.number_input("Token Min Odds", value=-200, step=25)
-    min_req_legs = eg3.number_input("Min Legs Required", min_value=1, max_value=10, value=1)
-    max_token_stake = eg4.number_input("Token Max Wager ($)", min_value=1.0, value=10.0, step=5.0)
-
-    eg5, eg6, eg7 = st.columns(3)
-    slip_odds = eg5.number_input("Your Ticket Odds", value=-105, step=5)
-    slip_legs = eg6.number_input("Your Ticket Legs", min_value=1, max_value=20, value=3)
-    slip_stake = eg7.number_input("Your Planned Stake ($)", min_value=0.5, value=5.0, step=0.5)
-
-    def odds_meets_min(actual: int, minimum: int) -> bool:
-        return amer_to_dec(actual) >= amer_to_dec(minimum)
-
-    promo_issues = []
-    if not odds_meets_min(int(slip_odds), int(min_req_odds)):
-        promo_issues.append(
-            f"Ticket odds ({int(slip_odds):+d}) are shorter/heavier than minimum required ({int(min_req_odds):+d})."
-        )
-    if int(slip_legs) < int(min_req_legs):
-        promo_issues.append(
-            f"Ticket has {int(slip_legs)} leg(s), but token requires at least {int(min_req_legs)}."
-        )
-    if float(slip_stake) > float(max_token_stake):
-        promo_issues.append(
-            f"Stake (${slip_stake:.2f}) exceeds token max wager (${max_token_stake:.2f})."
-        )
-    if token_kind == "Bonus Bet (SNR)" and int(slip_odds) < 100:
-        promo_issues.append(
-            "Bonus Bet (Stake Not Returned) on minus odds forfeits face value; target +110 or longer."
-        )
-
-    if promo_issues:
-        for issue in promo_issues:
-            st.warning(f"PROMO GUARDRAIL: {issue}")
-    else:
-        st.success(
-            f"ELIGIBLE: Ticket clears {token_kind} rules (no stacking with other promos)."
-        )
-
     capped_kelly = (
         min(rec_stake, max_single_bet)
         if (rec_stake > 0 and max_single_bet > 0)
         else max(unit_size, rec_stake)
     )
     render_inline_bet_logger(
-        key_prefix="tab4",
+        key_prefix="tab4_promo",
         max_single_cap=max_single_bet,
         default_plat="DraftKings",
         default_strat="Promo/Boost",
@@ -1311,7 +1241,7 @@ with tab4:
     )
 
 # ==========================================
-# TAB 5: ROI & CLV TRACKER (MASTER LEDGER)
+# TAB 5: ROI & CLV TRACKER
 # ==========================================
 with tab5:
     st.subheader("Master Bet Log, Strategy ROI & Closing Line Value (CLV)")
@@ -1358,10 +1288,10 @@ with tab5:
 
         submitted = st.form_submit_button("Log Bet")
         if submitted and b_pick.strip():
-            conflicts = find_roster_conflicts(b_pick)
-            if conflicts:
+            conflicts_m = find_roster_conflicts(b_pick)
+            if conflicts_m:
                 st.error(
-                    f"ROSTER BLOCK: '{', '.join(conflicts)}' is on your Restricted/Injury Watchlist."
+                    f"ROSTER CONFLICT: '{b_pick.strip()}' matches watchlist player(s): {', '.join(conflicts_m).title()}."
                 )
             else:
                 append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
@@ -1402,10 +1332,6 @@ with tab5:
             view_df = view_df[view_df["Result"] == res_filter]
 
         st.markdown("#### Settle Pending Bets / Edit Ledger Directly")
-        st.caption(
-            "Update `Result` (Win / Loss / Push / Void) or `Closing_Odds` directly in the table below and click "
-            "**Save Ledger Changes** to recalculate Profit, CLV, and book balances automatically."
-        )
         edited_df = st.data_editor(
             view_df,
             use_container_width=True,
@@ -1436,16 +1362,6 @@ with tab5:
                     res_val = str(row["Result"])
                     prof_val, clv_val = compute_profit_and_clv(st_val, od_val, cl_val, res_val)
                     if idx in merged_df.index:
-                        prev_res = str(merged_df.at[idx, "Result"])
-                        prev_plat = str(merged_df.at[idx, "Platform"])
-                        prev_stake = float(merged_df.at[idx, "Stake"])
-
-                        if prev_res == "Pending" and res_val != "Pending":
-                            if res_val == "Win":
-                                apply_bankroll_delta(prev_plat, prev_stake + prof_val)
-                            elif res_val in ("Push", "Void"):
-                                apply_bankroll_delta(prev_plat, prev_stake)
-
                         merged_df.at[idx, "Date"] = str(row["Date"])
                         merged_df.at[idx, "Platform"] = str(row["Platform"])
                         merged_df.at[idx, "Strategy"] = str(row["Strategy"])
