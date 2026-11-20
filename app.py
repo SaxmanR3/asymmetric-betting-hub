@@ -251,9 +251,10 @@ def find_roster_conflicts(pick_text: str) -> List[str]:
 # --- PERSISTENT BET LOG & BANKROLL AUTO-SYNC ---
 def init_bankroll_state() -> None:
     for plat, default_val in DEFAULT_BALANCES.items():
-        key = f"bal_{plat}"
-        if key not in st.session_state:
-            st.session_state[key] = default_val
+        if f"bal_{plat}" not in st.session_state:
+            st.session_state[f"bal_{plat}"] = default_val
+        if f"bal_adj_{plat}" not in st.session_state:
+            st.session_state[f"bal_adj_{plat}"] = 0.0
     if "auto_sync_bankroll" not in st.session_state:
         st.session_state["auto_sync_bankroll"] = True
 
@@ -261,9 +262,10 @@ def init_bankroll_state() -> None:
 def apply_bankroll_delta(plat: str, delta: float) -> None:
     if not st.session_state.get("auto_sync_bankroll", True):
         return
-    key = f"bal_{plat}"
-    if key in st.session_state:
-        st.session_state[key] = round(max(0.0, float(st.session_state[key]) + delta), 2)
+    matched_plat = next((p for p in PLATFORMS if p.lower() == plat.lower()), None)
+    if matched_plat:
+        adj_key = f"bal_adj_{matched_plat}"
+        st.session_state[adj_key] = round(float(st.session_state.get(adj_key, 0.0)) + delta, 2)
 
 
 def get_bet_log() -> pd.DataFrame:
@@ -599,7 +601,6 @@ def scan_fixture_ev(
         if not ref_book or not ref_sides:
             continue
 
-        # Automatically skip restricted/injured players in live scan results
         if is_prop and find_roster_conflicts(player_name):
             continue
 
@@ -676,17 +677,23 @@ init_bankroll_state()
 # --- SIDEBAR: LIVE BANKROLL & EXPOSURE ---
 with st.sidebar:
     st.header("Bankroll & Unit Rules")
-    dk_bal = st.number_input("DraftKings ($)", min_value=0.0, step=1.0, key="bal_DraftKings")
-    fd_bal = st.number_input("FanDuel ($)", min_value=0.0, step=1.0, key="bal_FanDuel")
-    pp_bal = st.number_input("PrizePicks ($)", min_value=0.0, step=1.0, key="bal_PrizePicks")
-    kalshi_bal = st.number_input("Kalshi ($)", min_value=0.0, step=1.0, key="bal_Kalshi")
-    mgm_bal = st.number_input("BetMGM ($)", min_value=0.0, step=1.0, key="bal_BetMGM")
-    fanatics_bal = st.number_input("Fanatics ($)", min_value=0.0, step=1.0, key="bal_Fanatics")
+    base_bals: Dict[str, float] = {}
+    adj_bals: Dict[str, float] = {}
+    for plat in PLATFORMS:
+        base_val = st.number_input(
+            f"{plat} ($)",
+            min_value=0.0,
+            step=1.0,
+            key=f"bal_{plat}",
+        )
+        adj_val = float(st.session_state.get(f"bal_adj_{plat}", 0.0))
+        base_bals[plat] = base_val
+        adj_bals[plat] = adj_val
 
     st.checkbox(
         "Auto-sync balances on log/settle",
         key="auto_sync_bankroll",
-        help="Automatically deducts Pending stakes and credits Win/Push/Void settlements.",
+        help="Tracks ledger cash adjustments separately from base inputs to avoid widget state errors.",
     )
 
     df_side = get_bet_log()
@@ -695,10 +702,23 @@ with st.sidebar:
         if not df_side.empty
         else 0.0
     )
-    liquid_roll = dk_bal + fd_bal + pp_bal + kalshi_bal + mgm_bal + fanatics_bal
+
+    sync_active = st.session_state.get("auto_sync_bankroll", True)
+    liquid_roll = round(
+        sum(
+            max(0.0, base_bals[p] + (adj_bals[p] if sync_active else 0.0))
+            for p in PLATFORMS
+        ),
+        2,
+    )
     total_roll = round(liquid_roll + pending_risk, 2)
 
     st.metric("Total Active Roll", f"${total_roll:,.2f}", f"Liquid: ${liquid_roll:,.2f}")
+    if sync_active and any(abs(adj_bals[p]) > 1e-6 for p in PLATFORMS):
+        adj_summary = ", ".join(
+            f"{p}: {adj_bals[p]:+.2f}" for p in PLATFORMS if abs(adj_bals[p]) > 1e-6
+        )
+        st.caption(f"Ledger Cash Deltas: {adj_summary}")
 
     unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
     max_single_bet = round(total_roll * 0.05, 2)
@@ -1420,7 +1440,6 @@ with tab5:
                         prev_plat = str(merged_df.at[idx, "Platform"])
                         prev_stake = float(merged_df.at[idx, "Stake"])
 
-                        # Auto-settle book cash delta when transitioning out of Pending
                         if prev_res == "Pending" and res_val != "Pending":
                             if res_val == "Win":
                                 apply_bankroll_delta(prev_plat, prev_stake + prof_val)
