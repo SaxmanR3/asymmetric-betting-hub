@@ -372,12 +372,9 @@ with tab1:
         posted_odds = st.number_input("Posted Ticket Odds (American)", value=-115, step=5)
         if st.button("Check Injury Updates"):
             st.info(
-                "Official & live injury boards:
-"
-                "- NBA Official Injury Report: https://official.nba.com/nba-injury-report/
-"
-                "- NFL Official Injury Report: https://www.nfl.com/injuries/
-"
+                "Official & live injury boards:\n"
+                "- NBA Official Injury Report: https://official.nba.com/nba-injury-report/\n"
+                "- NFL Official Injury Report: https://www.nfl.com/injuries/\n"
                 "- College Basketball & Football News: https://www.espn.com/injuries/"
             )
         injury_clear = st.checkbox("All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False)
