@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import math
 from datetime import date, timedelta
@@ -9,25 +9,27 @@ import streamlit as st
 from scipy.stats import norm
 from dotenv import load_dotenv
 
+# --- SETUP ---
 load_dotenv()
-BASE_URL = "https://api.oddspapi.io/v4"
-LOG_FILE = "bet_log.csv"
 
-def get_api_key() -> str:
+def _key() -> str:
     try:
         if "ODDSPAPI_API_KEY" in st.secrets:
-            val = str(st.secrets["ODDSPAPI_API_KEY"]).strip()
-            if val:
-                return val
+            v = str(st.secrets["ODDSPAPI_API_KEY"]).strip()
+            if v:
+                return v
     except Exception:
         pass
     return os.getenv("ODDSPAPI_API_KEY", "").strip()
 
-API_KEY = get_api_key()
+API_KEY = _key()
+BASE_URL = "https://api.oddspapi.io/v4"
+LOG_FILE = "bet_log.csv"
 
 st.set_page_config(page_title="Asymmetric Betting Hub", layout="wide")
 st.title("Asymmetric Betting Hub")
 
+# --- CORE MATH HELPERS ---
 def amer_to_dec(odds: float) -> float:
     return (1.0 + 100.0 / abs(odds)) if odds < 0 else (1.0 + odds / 100.0)
 
@@ -44,6 +46,7 @@ def prob_to_amer(p: float) -> int:
     return round(-100 * p / (1 - p)) if p >= 0.5 else round(100 * (1 - p) / p)
 
 def devig_two_way(odds_a: float, odds_b: float):
+    """Proportional devig + market width in cents."""
     pa, pb = amer_to_prob(odds_a), amer_to_prob(odds_b)
     overround = pa + pb
     fair_a, fair_b = pa / overround, pb / overround
@@ -74,18 +77,10 @@ def matches_league(fx: dict, league_filter: str) -> bool:
     if league_filter == "wnba":
         return "wnba" in tourn
     if league_filter == "ncaa":
-        return any(k in tourn for k in ("ncaa", "college", "fbs", "fcs", "division i", "cbb", "ncaab", "ncaaf"))
+        return any(k in tourn for k in ("ncaa", "college", "fbs", "fcs", "division i", "ncaab", "ncaaf"))
     if league_filter == "nfl":
         return "nfl" in tourn and "ncaa" not in tourn
     return league_filter in tourn
-
-def classify_level(fx: dict, default_level: str = "Pro") -> str:
-    tourn = (fx.get("tournamentName") or fx.get("tournamentSlug") or "").lower()
-    if any(k in tourn for k in ("ncaa", "college", "fbs", "fcs", "division i", "ncaab", "ncaaf")):
-        return "College"
-    if any(k in tourn for k in ("nfl", "nba", "wnba", "nhl", "mlb", "mls", "epl", "ucl", "atp", "wta", "ufc")):
-        return "Pro"
-    return default_level
 
 BOOK_LABELS = {
     "pinnacle": "Pinnacle",
@@ -102,9 +97,11 @@ def fmt_book(slug: str) -> str:
     return BOOK_LABELS.get(slug.lower(), slug.title())
 
 def load_market_catalog(sport_id: int) -> dict:
+    """Load market names/metadata from local cache or OddsPapi /v4/markets (1 credit once per sport)."""
     cache_key = f"market_catalog_{sport_id}"
     if cache_key in st.session_state:
         return st.session_state[cache_key]
+
     cache_file = f"markets_cache_{sport_id}.json"
     if os.path.exists(cache_file):
         try:
@@ -114,8 +111,10 @@ def load_market_catalog(sport_id: int) -> dict:
             return catalog
         except Exception:
             pass
+
     if not API_KEY:
         return {}
+
     r = requests.get(
         f"{BASE_URL}/markets",
         params={"apiKey": API_KEY, "sportId": sport_id, "language": "en"},
@@ -123,6 +122,7 @@ def load_market_catalog(sport_id: int) -> dict:
     )
     if r.status_code != 200:
         return {}
+
     raw = r.json()
     catalog = {}
     for m in raw:
@@ -136,15 +136,18 @@ def load_market_catalog(sport_id: int) -> dict:
             "marketLength": m.get("marketLength", len(outcomes)),
             "outcomes": outcomes,
         }
+
     try:
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(catalog, f)
     except Exception:
         pass
+
     st.session_state[cache_key] = catalog
     return catalog
 
 def parse_american_price(node: dict):
+    """Extract American odds from an OddsPapi player node."""
     if not isinstance(node, dict) or not node.get("active", False):
         return None
     dec = node.get("price")
@@ -166,6 +169,12 @@ def parse_american_price(node: dict):
     return None
 
 def scan_fixture_ev(b_odds: dict, catalog: dict, target_books: list, max_width: int, min_ev: float):
+    """
+    Split-devig engine:
+      - Main lines -> Pinnacle sharp reference (fallback: FanDuel)
+      - Player props -> FanDuel sharp reference (fallback: Pinnacle)
+    Returns (ev_rows, pp_rows).
+    """
     candidate_pairs = set()
     for ref_bk in ("pinnacle", "fanduel"):
         markets = b_odds.get(ref_bk, {}).get("markets", {})
@@ -227,6 +236,7 @@ def scan_fixture_ev(b_odds: dict, catalog: dict, target_books: list, max_width: 
             (oid1, label1, fair_p1, odds1, odds0),
         ]
 
+        # 1. Check PrizePicks Flex edges on two-way player props
         if is_prop:
             for oid, s_label, f_prob, r_this, r_opp in sides_info:
                 edge_6 = (f_prob - 0.5421) * 100.0
@@ -244,6 +254,7 @@ def scan_fixture_ev(b_odds: dict, catalog: dict, target_books: list, max_width: 
                         "5-Flex Edge %": round(edge_5, 2),
                     })
 
+        # 2. Compare target soft books against the devigged sharp fair price
         for tb in target_books:
             if tb == ref_book or tb not in b_odds:
                 continue
@@ -292,21 +303,22 @@ SD_MULTIPLIERS = {
 }
 
 DEFAULT_SPORTS = {
-    "Pro Football (NFL)": {"sportId": 14, "filter": "nfl", "level": "Pro"},
-    "College Football (NCAAF)": {"sportId": 14, "filter": "ncaa", "level": "College"},
-    "Pro Basketball (NBA)": {"sportId": 11, "filter": "nba", "level": "Pro"},
-    "College Basketball (NCAAB)": {"sportId": 11, "filter": "ncaa", "level": "College"},
-    "Pro Women's Basketball (WNBA)": {"sportId": 11, "filter": "wnba", "level": "Pro"},
-    "Pro Hockey (NHL)": {"sportId": 15, "filter": "nhl", "level": "Pro"},
-    "Pro Baseball (MLB)": {"sportId": 13, "filter": "mlb", "level": "Pro"},
-    "Soccer (MLS / EPL / UCL)": {"sportId": 10, "filter": "", "level": "Pro"},
-    "Tennis (ATP / WTA)": {"sportId": 12, "filter": "", "level": "Pro"},
-    "Boxing": {"sportId": 21, "filter": "", "level": "Pro"},
+    "Pro Football (NFL)": {"sportId": 14, "filter": "nfl"},
+    "College Football (NCAAF)": {"sportId": 14, "filter": "ncaa"},
+    "Pro Basketball (NBA)": {"sportId": 11, "filter": "nba"},
+    "College Basketball (NCAAB)": {"sportId": 11, "filter": "ncaa"},
+    "Pro Women's Basketball (WNBA)": {"sportId": 11, "filter": "wnba"},
+    "Pro Hockey (NHL)": {"sportId": 15, "filter": "nhl"},
+    "Pro Baseball (MLB)": {"sportId": 13, "filter": "mlb"},
+    "Soccer (MLS / EPL / UCL)": {"sportId": 10, "filter": ""},
+    "Tennis (ATP / WTA)": {"sportId": 12, "filter": ""},
+    "Boxing": {"sportId": 21, "filter": ""},
 }
 
 TARGET_SOFT_BOOKS = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics", "caesars", "bet365"]
 PRIORITY_BOOKS = ["pinnacle", "fanduel", "draftkings", "kalshi", "betmgm", "fanatics", "caesars", "bet365"]
 
+# --- SIDEBAR: LIVE BANKROLL ---
 with st.sidebar:
     st.header("Bankroll & Unit Rules")
     fd_bal = st.number_input("FanDuel ($)", min_value=0.0, value=25.00, step=0.5, format="%.2f")
@@ -326,6 +338,7 @@ with st.sidebar:
     else:
         st.warning("No ODDSPAPI_API_KEY in Secrets or .env")
 
+# --- 5 MAIN TABS ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1. Combos & Singles",
     "2. PrizePicks & +EV Scanner",
@@ -334,46 +347,71 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "5. ROI & CLV Tracker",
 ])
 
+# ==========================================
+# TAB 1: COMBOS & SINGLES (80% FLOOR ENGINE)
+# ==========================================
 with tab1:
     st.subheader("Combos & Singles Guardrail (PA / PRA / Rush+Rec)")
     st.caption("80% single breakeven: **-400** | Two 80% legs: **64.0% (-178)** | Three 80% legs: **51.2% (-105)**")
+
     c1, c2 = st.columns(2)
     with c1:
         num_legs = st.radio("Number of Floor Legs", [1, 2, 3], horizontal=True, index=2)
         est_hit = st.slider("Estimated Hit Rate per Leg (%)", 65, 90, 80) / 100.0
     with c2:
         posted_odds = st.number_input("Posted Book Odds (American)", value=-115, step=5)
+        if st.button("Check Injury Updates"):
+            st.info(
+                "Official & live injury boards:\n"
+                "- NBA Official Injury Report: https://official.nba.com/nba-injury-report/\n"
+                "- NFL Official Injury Report: https://www.nfl.com/injuries/\n"
+                "- College Basketball & Football News: https://www.espn.com/injuries/"
+            )
         injury_clear = st.checkbox("All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False)
+
     comb_prob = est_hit ** num_legs
     fair_odds = prob_to_amer(comb_prob)
     ev_pct = calc_ev(comb_prob, posted_odds)
+
     m1, m2, m3 = st.columns(3)
     m1.metric("Combined Hit Rate", f"{comb_prob*100:.1f}%")
     m2.metric("Fair Breakeven Odds", f"{fair_odds:+d}")
     m3.metric("Estimated EV", f"{ev_pct:+.1f}%")
+
     if not injury_clear:
         st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
     elif ev_pct < 0:
         st.warning(f"JUICE LEAK: Posted {posted_odds:+d} is worse than your fair price ({fair_odds:+d}). Shop books or pass.")
     else:
-        st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Recommended Singles-First Split: **${unit_size:.2f}** per straight + **${unit_size*0.25:.2f}** combo kicker.")
+        straight_stake = round(min(unit_size, max_single_bet), 2)
+        kicker_stake = round(min(unit_size * 0.25, max_single_bet), 2)
+        if num_legs == 1:
+            st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Auto Straight Stake: **${straight_stake:.2f}** (capped at ${max_single_bet:.2f}).")
+        else:
+            st.success(f"GREEN LIGHT (+{ev_pct:.1f}% EV). Auto Split: **${straight_stake:.2f}** per straight + **${kicker_stake:.2f}** {num_legs}-leg combo kicker.")
 
+# ==========================================
+# TAB 2: PRIZEPICKS & +EV SCANNER (ODDSPAPI)
+# ==========================================
 with tab2:
     st.subheader("Live OddsPapi Feed + Auto Split-Devig & PrizePicks Scanner")
-    st.caption("College & Pro Separated | Main Lines -> Devig to **Pinnacle** | Player Props -> Devig to **FanDuel** | PP 5-Flex BE: **54.25%** | 6-Flex BE: **54.21**")
+    st.caption("College & Pro Separated | Main Lines -> Devig to **Pinnacle** | Player Props -> Devig to **FanDuel** | PP 5-Flex BE: **54.25% (-119)** | 6-Flex BE: **54.21% (-118)**")
+
     if "sport_map" not in st.session_state:
         st.session_state["sport_map"] = dict(DEFAULT_SPORTS)
-    col_a, col_b, col_c, col_d = st.columns(4)
+
+    col_a, col_b, col_c = st.columns(3)
     selected_sport = col_a.selectbox("Sport / League", list(st.session_state["sport_map"].keys()))
-    level_filter = col_b.selectbox("Level Split", ["All", "College Only", "Pro Only"])
-    max_width = col_c.number_input("Max Market Width (cents)", min_value=5, max_value=60, value=25)
-    min_ev = col_d.number_input("Min EV % to Flag", min_value=0.0, max_value=20.0, value=2.0, step=0.5)
+    max_width = col_b.number_input("Max Market Width (cents)", min_value=5, max_value=60, value=25)
+    min_ev = col_c.number_input("Min EV % to Flag", min_value=0.0, max_value=20.0, value=2.0, step=0.5)
+
     selected_books = st.multiselect(
         "Target Books to Shop",
         TARGET_SOFT_BOOKS,
         default=["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"],
         format_func=fmt_book,
     )
+
     b1, b2 = st.columns([2, 1])
     if b1.button("Pull Upcoming Fixtures (1 API Credit)"):
         if not API_KEY:
@@ -394,29 +432,18 @@ with tab2:
                     data = r.json()
                     raw_fixtures = data if isinstance(data, list) else data.get("fixtures", [])
                     league_filter = cfg.get("filter", "")
-                    default_lvl = cfg.get("level", "Pro")
-                    fixtures = []
-                    for fx in raw_fixtures:
-                        if not matches_league(fx, league_filter):
-                            continue
-                        lvl = classify_level(fx, default_lvl)
-                        if level_filter == "College Only" and lvl != "College":
-                            continue
-                        if level_filter == "Pro Only" and lvl != "Pro":
-                            continue
-                        fx_copy = dict(fx)
-                        fx_copy["_level"] = lvl
-                        fixtures.append(fx_copy)
+                    fixtures = [fx for fx in raw_fixtures if matches_league(fx, league_filter)]
                     st.session_state["fixtures"] = fixtures
                     st.session_state["fixtures_sport_id"] = cfg["sportId"]
                     if fixtures:
-                        st.success(f"Loaded {len(fixtures)} upcoming {selected_sport} games ({level_filter}).")
+                        st.success(f"Loaded {len(fixtures)} upcoming {selected_sport} games.")
                     else:
-                        st.warning(f"No upcoming {selected_sport} games found in the next 7 days.")
+                        st.warning(f"No upcoming {selected_sport} games found in the next 7 days (offseason or lines not posted yet).")
                 else:
                     st.error(f"API Error {r.status_code}: {r.text[:250]}")
             except Exception as e:
                 st.error(f"Connection error: {e}")
+
     if b2.button("Load All Sports (UFC/Golf/etc.)"):
         if not API_KEY:
             st.error("Add ODDSPAPI_API_KEY to Streamlit Secrets or .env first.")
@@ -431,13 +458,14 @@ with tab2:
                         name = s.get("sportName")
                         sid = s.get("sportId")
                         if name and sid and sid not in existing_ids:
-                            merged[name] = {"sportId": sid, "filter": "", "level": "Pro"}
+                            merged[name] = {"sportId": sid, "filter": ""}
                     st.session_state["sport_map"] = merged
                     st.rerun()
                 else:
                     st.error(f"API Error {r.status_code}: {r.text[:200]}")
             except Exception as e:
                 st.error(f"Connection error: {e}")
+
     if "fixtures" in st.session_state and st.session_state["fixtures"]:
         search_txt = st.text_input("Filter by Team (optional, 0 credits)", value="").strip().lower()
         fx_options = {}
@@ -447,12 +475,12 @@ with tab2:
                 continue
             p1 = fx.get("participant1Name", "Away")
             p2 = fx.get("participant2Name", "Home")
-            lvl = fx.get("_level", "Pro")
             tourn = fx.get("tournamentName") or fx.get("tournamentSlug") or ""
             stime = fx.get("startTime", "")[:16].replace("T", " ")
-            label = f"[{lvl} | {tourn}] {p1} vs {p2} ({stime})" if tourn else f"[{lvl}] {p1} vs {p2} ({stime})"
+            label = f"[{tourn}] {p1} vs {p2} ({stime})" if tourn else f"{p1} vs {p2} ({stime})"
             if not search_txt or search_txt in label.lower():
                 fx_options[label] = fid
+
         if fx_options:
             chosen_label = st.selectbox(f"Select Game to Scan ({len(fx_options)} found)", list(fx_options.keys())[:100])
             if st.button("Scan & Find +EV / PrizePicks Plays (1 API Credit)"):
@@ -476,27 +504,35 @@ with tab2:
                             st.error(f"API Error {r.status_code}: {r.text[:250]}")
                     except Exception as e:
                         st.error(f"Error fetching odds: {e}")
+
         if "last_b_odds" in st.session_state and st.session_state["last_b_odds"]:
             b_odds = st.session_state["last_b_odds"]
             catalog = st.session_state.get("last_catalog", {})
-            ev_rows, pp_rows = scan_fixture_ev(b_odds, catalog, selected_books, max_width, min_ev)
+            ev_rows, pp_rows = scan_fixture_ev(
+                b_odds, catalog, selected_books, max_width, min_ev
+            )
+
             st.markdown(f"### Results: {st.session_state.get('last_scan_game', '')}")
             key_books = [b for b in PRIORITY_BOOKS if b in b_odds]
-            st.caption(f"Live sharp/target books in this scan: **{ ', '.join(fmt_book(b) for b in key_books) }** — Adjust Max Width, Min EV, or Target Books above to re-filter for 0 credits.")
+            st.caption(f"Live sharp/target books in this scan: **{', '.join(fmt_book(b) for b in key_books)}** — Adjust Max Width, Min EV, or Target Books above to re-filter for 0 credits.")
+
             st.markdown(f"#### +EV Soft Book Plays ({len(ev_rows)} found)")
             if ev_rows:
                 st.dataframe(pd.DataFrame(ev_rows), width="stretch")
             else:
-                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {', '.join(fmt_book(b) for b in selected_books)}.")
+                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {', '.join(fmt_book(b) for b in selected_books)}. Try lowering Min EV to 1.0% or raising Max Width to 30c.")
+
             st.markdown(f"#### PrizePicks 5/6-Flex Qualifying Props ({len(pp_rows)} found)")
             if pp_rows:
                 st.dataframe(pd.DataFrame(pp_rows), width="stretch")
             else:
-                st.info(f"No two-way player props cleared 54.21% true probability under {max_width}c width yet.")
+                st.info(f"No two-way player props cleared 54.21% true probability under {max_width}c width yet (props often tighten closer to kickoff/tipoff).")
+
             with st.expander("View Active Books & Market Counts"):
                 ordered_books = key_books + [b for b in b_odds.keys() if b not in key_books]
                 summary_rows = [{"Bookmaker": fmt_book(bk), "Active Markets": len(b_odds[bk].get("markets", {}))} for bk in ordered_books[:20]]
                 st.dataframe(pd.DataFrame(summary_rows), width="stretch")
+
     st.divider()
     st.markdown("#### Quick Manual Devig & PrizePicks Edge Checker (0 API Credits)")
     qc1, qc2, qc3, qc4 = st.columns(4)
@@ -504,17 +540,23 @@ with tab2:
     sharp_under = qc2.number_input("Sharp/FD Under Odds", value=105, step=1)
     target_book_odds = qc3.number_input("Soft Book Over Odds", value=-115, step=1)
     pp_mode = qc4.selectbox("Compare vs. PrizePicks?", ["6-Pick Flex (54.21%)", "5-Pick Flex (54.25%)"])
+
     fair_o, fair_u, vig_pct, width_c = devig_two_way(sharp_over, sharp_under)
     soft_ev = calc_ev(fair_o, target_book_odds)
     pp_be = 0.5421 if "6-Pick" in pp_mode else 0.5425
+
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("True Fair Over %", f"{fair_o*100:.2f}%", f"Fair {prob_to_amer(fair_o):+d}")
     r2.metric("Market Width", f"{width_c:.0f} cents", f"Vig: {vig_pct:.2f}%")
     r3.metric("Soft Book EV", f"{soft_ev:+.2f}%")
     r4.metric("PrizePicks Edge", f"{(fair_o - pp_be)*100:+.2f}%", "PLAY" if fair_o > pp_be else "PASS")
-    if width_c > max_width:
-        st.warning(f"WIDTH WARNING: {width_c:.0f}c exceeds your {max_width}c confidence cap.")
 
+    if width_c > max_width:
+        st.warning(f"WIDTH WARNING: {width_c:.0f}c exceeds your {max_width}c confidence cap. Book is guessing—size down or pass.")
+
+# ==========================================
+# TAB 3: LAYER 3 SKEW & ALT LADDER
+# ==========================================
 with tab3:
     st.subheader("Layer 3: Log-Normal Right Skew & Alt-Ladder Pricer")
     lc1, lc2 = st.columns(2)
@@ -536,16 +578,20 @@ with tab3:
         else:
             sd_val = proj_mean * SD_MULTIPLIERS[prop_type]
             st.info(f"Using League Multiplier **{SD_MULTIPLIERS[prop_type]}** -> SD = **{sd_val:.2f}**")
+
     p_sym = 1.0 - norm.cdf(main_line, loc=proj_mean, scale=sd_val)
     mu, sigma = lognormal_params(proj_mean, sd_val)
     skew_median = math.exp(mu)
     p_skew = 1.0 - norm.cdf(math.log(main_line), loc=mu, scale=sigma)
+
     ev_sym = calc_ev(p_sym, main_odds)
     ev_skew = calc_ev(p_skew, main_odds)
+
     s1, s2, s3 = st.columns(3)
     s1.metric("Symmetric Over % (Naive)", f"{p_sym*100:.1f}%", f"EV: {ev_sym:+.1f}%")
     s2.metric("Skewed Median (Typical Game)", f"{skew_median:.1f}", f"vs Mean {proj_mean:.1f}")
     s3.metric("Right-Skewed Over % (Honest)", f"{p_skew*100:.1f}%", f"EV: {ev_skew:+.1f}%")
+
     st.markdown("#### Fair Alternate Ladder (Compare Against DK & FD)")
     step_size = 10.0 if proj_mean >= 40 else 5.0
     base_rung = max(step_size, math.floor((proj_mean * 0.55) / step_size) * step_size) - 0.5
@@ -561,6 +607,9 @@ with tab3:
         })
     st.dataframe(pd.DataFrame(ladder_rows), width="stretch")
 
+# ==========================================
+# TAB 4: PROMO & BANKROLL GUARDRAILS
+# ==========================================
 with tab4:
     st.subheader("Promo Converter & Fractional Kelly Sizer")
     pc1, pc2 = st.columns(2)
@@ -575,21 +624,27 @@ with tab4:
         st.metric("Recommended Stake", f"${rec_stake:.2f}", f"Full Kelly: {full_k*100:.2f}%")
         if rec_stake > max_single_bet:
             st.warning(f"Capped at 5% guardrail: **${max_single_bet:.2f}**")
+
     with pc2:
         st.markdown("##### Bonus Bet / Site Credit Hedge Converter")
         promo_type = st.selectbox("Promo Type", ["Bonus Bet (Stake Not Returned)", "Site Credit (Stake Returned)"])
         promo_amt = st.number_input("Promo Amount ($)", min_value=5.0, value=50.0, step=5.0)
         promo_odds = st.number_input("Promo Side Odds (+)", min_value=100, value=300, step=10)
         hedge_odds = st.number_input("Hedge Side Odds (-)", max_value=-100, value=-350, step=10)
+
         p_dec = amer_to_dec(promo_odds)
         h_dec = amer_to_dec(hedge_odds)
         gross_win = promo_amt * (p_dec - 1.0) if "Bonus Bet" in promo_type else promo_amt * p_dec
         hedge_stake = gross_win / h_dec
         guaranteed_profit = gross_win - hedge_stake
         conv_rate = (guaranteed_profit / promo_amt) * 100.0
+
         st.metric("Hedge Stake Needed", f"${hedge_stake:.2f}")
         st.metric("Guaranteed Cash Profit", f"${guaranteed_profit:.2f}", f"{conv_rate:.1f}% Conversion")
 
+# ==========================================
+# TAB 5: ROI & CLV TRACKER
+# ==========================================
 with tab5:
     st.subheader("Bet Log, Strategy ROI & Closing Line Value (CLV)")
     if os.path.exists(LOG_FILE):
@@ -598,17 +653,20 @@ with tab5:
         df_log = pd.DataFrame(columns=[
             "Date", "Platform", "Strategy", "Pick", "Stake", "Odds", "Closing_Odds", "Result", "Profit", "CLV_Pct"
         ])
+
     with st.form("log_bet_form", clear_on_submit=True):
         f1, f2, f3, f4 = st.columns(4)
         b_date = f1.date_input("Date")
         b_plat = f2.selectbox("Platform", ["FanDuel", "DraftKings", "PrizePicks", "Kalshi", "BetMGM", "Fanatics"])
         b_strat = f3.selectbox("Strategy", ["Combos/Singles", "Alt Ladder", "5/6-Pick Flex", "Promo/Boost", "Neg-Corr SGP"])
         b_pick = f4.text_input("Pick Description")
+
         f5, f6, f7, f8 = st.columns(4)
         b_stake = f5.number_input("Stake ($)", min_value=0.5, value=2.0, step=0.5)
         b_odds = f6.number_input("Bet Odds", value=-110, step=5)
         b_close = f7.number_input("Closing Odds (for CLV)", value=-115, step=5)
         b_res = f8.selectbox("Result", ["Pending", "Win", "Loss", "Void"])
+
         submitted = st.form_submit_button("Log Bet")
         if submitted and b_pick:
             profit = 0.0
@@ -625,15 +683,17 @@ with tab5:
             df_log = pd.concat([df_log, new_row], ignore_index=True)
             df_log.to_csv(LOG_FILE, index=False)
             st.success("Bet logged to bet_log.csv!")
+
     if not df_log.empty:
         settled = df_log[df_log["Result"].isin(["Win", "Loss"])]
         tot_staked = settled["Stake"].sum()
         tot_profit = settled["Profit"].sum()
         roi = (tot_profit / tot_staked * 100.0) if tot_staked > 0 else 0.0
         avg_clv = df_log["CLV_Pct"].mean()
+
         t1, t2, t3 = st.columns(3)
         t1.metric("Net Profit", f"${tot_profit:+.2f}")
         t2.metric("Overall ROI", f"{roi:+.1f}%")
         t3.metric("Avg CLV", f"{avg_clv:+.2f}%")
-        st.dataframe(df_log, width="stretch")
 
+        st.dataframe(df_log, width="stretch")
