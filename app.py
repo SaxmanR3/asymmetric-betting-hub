@@ -1,4 +1,6 @@
 import os
+import io
+import csv
 import json
 import math
 from datetime import date, timedelta
@@ -160,6 +162,71 @@ def append_bet_record(b_date, plat: str, strat: str, pick: str, stake: float, od
     df = pd.concat([df, new_row], ignore_index=True)
     save_bet_log(df)
 
+def parse_and_import_csv_lines(raw_text: str) -> tuple[int, list[str]]:
+    """
+    Parse pasted CSV lines (with or without header) and append valid rows to bet_log.
+    Supports either full 10-column rows or compact 8-column rows:
+      Date,Platform,Strategy,Pick,Stake,Odds,Closing_Odds,Result[,Profit,CLV_Pct]
+    """
+    cleaned = raw_text.strip()
+    if not cleaned:
+        return 0, ["Paste at least one CSV line first."]
+
+    reader = csv.reader(io.StringIO(cleaned))
+    added = 0
+    errors = []
+    for line_no, parts in enumerate(reader, start=1):
+        if not parts or all(not p.strip() for p in parts):
+            continue
+        first_cell = parts[0].strip().lower()
+        if first_cell == "date" and len(parts) >= 4 and parts[1].strip().lower() == "platform":
+            continue
+        if len(parts) < 8:
+            errors.append(f"Line {line_no}: expected at least 8 comma-separated values (got {len(parts)}).")
+            continue
+        try:
+            b_date = parts[0].strip() or str(date.today())
+            plat = parts[1].strip() or "DraftKings"
+            strat = parts[2].strip() or "+EV Straight"
+            pick = parts[3].strip()
+            if not pick:
+                errors.append(f"Line {line_no}: Pick Description is empty.")
+                continue
+            stake = float(parts[4].strip().replace("$", ""))
+            odds = int(round(float(parts[5].strip().replace("+", ""))))
+            close_raw = parts[6].strip().replace("+", "")
+            close_odds = int(round(float(close_raw))) if close_raw else odds
+            res = parts[7].strip().title() if parts[7].strip() else "Pending"
+            if res not in ["Pending", "Win", "Loss", "Void"]:
+                res = "Pending"
+            append_bet_record(b_date, plat, strat, pick, stake, odds, close_odds, res)
+            added += 1
+        except Exception as e:
+            errors.append(f"Line {line_no}: could not parse ({e}).")
+    return added, errors
+
+def render_quick_paste_csv(key_prefix: str):
+    """Compact Quick Paste CSV box for instant one-line or multi-line bet imports."""
+    st.markdown("**Quick Paste CSV Line(s)** *(Paste lines generated in chat and click Import)*")
+    st.caption("Format: `Date,Platform,Strategy,Pick,Stake,Odds,Closing_Odds,Result`")
+    p_col1, p_col2 = st.columns([4.2, 1.0])
+    pasted = p_col1.text_area(
+        "Paste CSV rows",
+        placeholder="2026-11-20,DraftKings,+EV Straight,Derrick Henry Over 70.5 Rush Yds,2.00,-114,-114,Pending",
+        height=68,
+        label_visibility="collapsed",
+        key=f"{key_prefix}_csv_paste",
+    )
+    p_col2.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+    if p_col2.button("Import CSV", key=f"{key_prefix}_csv_import_btn", width="stretch"):
+        added, errors = parse_and_import_csv_lines(pasted)
+        if added > 0:
+            st.success(f"Imported {added} bet(s) into bet_log.csv!")
+        for err in errors:
+            st.warning(err)
+        if added > 0:
+            st.rerun()
+
 def render_inline_bet_logger(
     key_prefix: str,
     default_plat: str = "FanDuel",
@@ -169,9 +236,11 @@ def render_inline_bet_logger(
     default_odds: int = -110,
     expanded: bool = False,
 ):
-    """Reusable inline bet logger + recent log drawer for every tab."""
+    """Reusable inline bet logger + Quick Paste CSV + recent log drawer for every tab."""
     st.divider()
     with st.expander(f"Quick Bet Logger & Live Log ({len(get_bet_log())} logged)", expanded=expanded):
+        render_quick_paste_csv(key_prefix)
+        st.markdown("---")
         with st.form(f"{key_prefix}_quick_log_form", clear_on_submit=False):
             c1, c2, c3, c4 = st.columns([1.1, 1.2, 1.3, 2.4])
             b_date = c1.date_input("Date", value=date.today(), key=f"{key_prefix}_date")
@@ -910,6 +979,9 @@ with tab5:
                 st.error("CSV columns do not match bet_log.csv format.")
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
+
+    with st.expander("Quick Paste CSV Line(s) — Bulk Import Without Typing", expanded=True):
+        render_quick_paste_csv("tab5")
 
     with st.form("log_bet_form", clear_on_submit=True):
         f1, f2, f3, f4 = st.columns(4)
