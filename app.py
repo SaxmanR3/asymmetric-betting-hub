@@ -36,11 +36,17 @@ st.title("Asymmetric Betting Hub")
 st.caption("NBA Cup Slate · Nov 20, 2026 · 80% Floor · Layer 3 Ladder · Fractional Kelly")
 
 with st.sidebar:
-    bankroll = st.number_input("Bankroll ($)", 0.0, 100000.0, 54.92, 0.5, "%.2f")
+    st.subheader("Bankroll by App")
+    fd_br = st.number_input("FanDuel ($)", 0.0, 100000.0, 25.00, 0.5, "%.2f")
+    dk_br = st.number_input("DraftKings ($)", 0.0, 100000.0, 19.92, 0.5, "%.2f")
+    kl_br = st.number_input("Kalshi ($)", 0.0, 100000.0, 10.00, 0.5, "%.2f")
+    pm_br = st.number_input("Polymarket ($)", 0.0, 100000.0, 0.00, 0.5, "%.2f")
+    app_bankrolls = {"FanDuel": fd_br, "DraftKings": dk_br, "Kalshi": kl_br, "Polymarket": pm_br}
+    total_bankroll = round(sum(app_bankrolls.values()), 2)
     cap_pct = st.slider("Max Stake Cap (%)", 1.0, 10.0, 5.0, 0.5)
-    cap_usd = round(bankroll * cap_pct / 100.0, 2)
     kelly_f = st.selectbox("Kelly Fraction", [0.1, 0.25, 0.5, 1.0], 1, format_func=lambda x: f"{int(x*100)}%")
-    st.metric("Max Bet Cap", f"${cap_usd:.2f}")
+    st.divider()
+    st.metric("Combined Total Bankroll", f"${total_bankroll:.2f}")
     api_key = get_key()
     if api_key:
         st.success("OddsPapi Key Ready")
@@ -50,11 +56,15 @@ with st.sidebar:
 t1, t2, t3, t4 = st.tabs(["80% Floor & Kelly", "Layer 3 Ladder", "Scanner & Cache", "Bet Log"])
 
 with t1:
-    c1, c2, c3 = st.columns(3)
+    c0, c1, c2, c3 = st.columns(4)
+    app_name = c0.selectbox("Betting App", list(app_bankrolls.keys()))
     mkt = c1.text_input("Market", "NBA Cup Prop")
     prob = c2.slider("Floor Hit Prob (%)", 50.0, 99.0, 82.0, 0.5)
     odds = c3.number_input("American Odds", -2000, 2000, -220, 5)
-    stake = kelly_stake(prob / 100.0, float(odds), float(bankroll), float(kelly_f), cap_usd)
+    active_br = float(app_bankrolls[app_name])
+    active_cap = round(active_br * cap_pct / 100.0, 2)
+    stake = kelly_stake(prob / 100.0, float(odds), active_br, float(kelly_f), active_cap)
+    st.caption(f"{app_name} Bankroll: ${active_br:.2f} · {app_name} Max Cap ({cap_pct:.1f}%): ${active_cap:.2f}")
     st.metric("Implied Prob", f"{imp_prob(float(odds))*100:.1f}%")
     st.metric("Suggested Stake", f"${stake:.2f}")
     if prob >= 80.0:
@@ -62,14 +72,14 @@ with t1:
     else:
         st.error("BELOW 80% FLOOR")
     if st.button("Log Bet"):
-        row = pd.DataFrame([{"ts": datetime.now().isoformat(timespec="seconds"), "mkt": mkt, "odds": odds, "prob": prob, "stake": stake}])
+        row = pd.DataFrame([{"ts": datetime.now().isoformat(timespec="seconds"), "app": app_name, "mkt": mkt, "odds": odds, "prob": prob, "stake": stake}])
         out = pd.concat([pd.read_csv(LOG_PATH), row], ignore_index=True) if LOG_PATH.exists() else row
         out.to_csv(LOG_PATH, index=False)
         st.success("Saved to bet_log.csv")
 
 with t2:
     base_line = st.number_input("Base Line", 0.5, 100.0, 20.0, 0.5)
-    rows = [{"Rung": i, "Alt": f"{round(base_line*m,1)}+", "Est %": f"{88-(i-1)*11:.1f}%", "Stake": kelly_stake((88-(i-1)*11)/100, -240 if i<=2 else -140, bankroll, kelly_f, cap_usd)} for i, m in enumerate([0.75, 0.85, 0.95, 1.0], 1)]
+    rows = [{"Rung": i, "Alt": f"{round(base_line*m,1)}+", "Est %": f"{88-(i-1)*11:.1f}%", "Stake": kelly_stake((88-(i-1)*11)/100, -240 if i<=2 else -140, total_bankroll, kelly_f, round(total_bankroll*cap_pct/100.0, 2))} for i, m in enumerate([0.75, 0.85, 0.95, 1.0], 1)]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with t3:
