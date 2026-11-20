@@ -121,6 +121,15 @@ SD_MULTIPLIERS = {
     "Custom / Game-Log Driven": 0.45,
 }
 
+DEFAULT_BALANCES = {
+    "DraftKings": 40.12,
+    "FanDuel": 14.80,
+    "PrizePicks": 0.00,
+    "Kalshi": 0.00,
+    "BetMGM": 0.00,
+    "Fanatics": 0.00,
+}
+
 st.set_page_config(page_title="Asymmetric Betting Hub", layout="wide")
 st.title("Asymmetric Betting Hub")
 
@@ -226,7 +235,37 @@ def matches_league(fx: dict, league_filter: str) -> bool:
     return league_filter in blob
 
 
-# --- PERSISTENT BET LOG ENGINE ---
+# --- AUTOMATED ROSTER & INJURY WATCHLIST ---
+def get_restricted_players() -> List[str]:
+    raw = st.session_state.get("restricted_players_raw", "")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def find_roster_conflicts(pick_text: str) -> List[str]:
+    if not pick_text:
+        return []
+    lower_pick = pick_text.lower()
+    return [p for p in get_restricted_players() if p.lower() in lower_pick]
+
+
+# --- PERSISTENT BET LOG & BANKROLL AUTO-SYNC ---
+def init_bankroll_state() -> None:
+    for plat, default_val in DEFAULT_BALANCES.items():
+        key = f"bal_{plat}"
+        if key not in st.session_state:
+            st.session_state[key] = default_val
+    if "auto_sync_bankroll" not in st.session_state:
+        st.session_state["auto_sync_bankroll"] = True
+
+
+def apply_bankroll_delta(plat: str, delta: float) -> None:
+    if not st.session_state.get("auto_sync_bankroll", True):
+        return
+    key = f"bal_{plat}"
+    if key in st.session_state:
+        st.session_state[key] = round(max(0.0, float(st.session_state[key]) + delta), 2)
+
+
 def get_bet_log() -> pd.DataFrame:
     if "bet_log_df" not in st.session_state:
         if os.path.exists(LOG_FILE):
@@ -289,6 +328,13 @@ def append_bet_record(
     )
     save_bet_log(pd.concat([df, new_row], ignore_index=True))
 
+    if res == "Pending":
+        apply_bankroll_delta(plat, -float(stake))
+    elif res == "Win":
+        apply_bankroll_delta(plat, profit)
+    elif res == "Loss":
+        apply_bankroll_delta(plat, -float(stake))
+
 
 def parse_and_import_csv_lines(raw_text: str) -> Tuple[int, List[str]]:
     cleaned = raw_text.strip()
@@ -314,6 +360,12 @@ def parse_and_import_csv_lines(raw_text: str) -> Tuple[int, List[str]]:
             pick = ",".join(parts[3: len(parts) - 4]).strip() if len(parts) > 8 else parts[3].strip()
             if not pick:
                 errors.append(f"Line {line_no}: Pick Description is empty.")
+                continue
+            conflicts = find_roster_conflicts(pick)
+            if conflicts:
+                errors.append(
+                    f"Line {line_no} ({pick}): blocked by Restricted Roster Watchlist ({', '.join(conflicts)})."
+                )
                 continue
             stake = float(parts[-4].strip().replace("$", ""))
             odds = int(round(float(parts[-3].strip().replace("+", ""))))
@@ -388,12 +440,17 @@ def render_inline_bet_logger(
             submitted = c9.form_submit_button("Log Bet", use_container_width=True)
 
             if submitted:
+                conflicts = find_roster_conflicts(b_pick)
                 if not b_pick.strip():
                     st.warning("Enter a Pick Description before logging.")
+                elif conflicts:
+                    st.error(
+                        f"ROSTER BLOCK: '{', '.join(conflicts)}' is on your Restricted/Injury Watchlist."
+                    )
                 else:
                     if max_single_cap > 0 and b_stake > max_single_cap:
                         st.warning(
-                            f"Stake ${b_stake:.2f} exceeds 5% cap (${max_single_cap:.2f}); logged anyway for tracking."
+                            f"Stake ${b_stake:.2f} exceeds 5% cap (${max_single_cap:.2f}); logged for tracking."
                         )
                     append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
                     st.success(f"Logged: {b_pick.strip()} (${b_stake:.2f} @ {int(b_odds):+d}) on {b_plat}")
@@ -542,6 +599,10 @@ def scan_fixture_ev(
         if not ref_book or not ref_sides:
             continue
 
+        # Automatically skip restricted/injured players in live scan results
+        if is_prop and find_roster_conflicts(player_name):
+            continue
+
         oid0, odds0, oid1, odds1 = ref_sides
         fair_p0, fair_p1, _, width_c = devig_two_way(odds0, odds1)
         if width_c > max_width:
@@ -610,22 +671,23 @@ def scan_fixture_ev(
     return ev_rows, pp_rows
 
 
+init_bankroll_state()
+
 # --- SIDEBAR: LIVE BANKROLL & EXPOSURE ---
 with st.sidebar:
     st.header("Bankroll & Unit Rules")
-    dk_bal = st.number_input("DraftKings ($)", min_value=0.0, value=40.12, step=1.0)
-    fd_bal = st.number_input("FanDuel ($)", min_value=0.0, value=14.80, step=1.0)
-    pp_bal = st.number_input("PrizePicks ($)", min_value=0.0, value=0.00, step=1.0)
-    kalshi_bal = st.number_input("Kalshi ($)", min_value=0.0, value=0.00, step=1.0)
-    mgm_bal = st.number_input("BetMGM ($)", min_value=0.0, value=0.00, step=1.0)
-    fanatics_bal = st.number_input("Fanatics ($)", min_value=0.0, value=0.00, step=1.0)
+    dk_bal = st.number_input("DraftKings ($)", min_value=0.0, step=1.0, key="bal_DraftKings")
+    fd_bal = st.number_input("FanDuel ($)", min_value=0.0, step=1.0, key="bal_FanDuel")
+    pp_bal = st.number_input("PrizePicks ($)", min_value=0.0, step=1.0, key="bal_PrizePicks")
+    kalshi_bal = st.number_input("Kalshi ($)", min_value=0.0, step=1.0, key="bal_Kalshi")
+    mgm_bal = st.number_input("BetMGM ($)", min_value=0.0, step=1.0, key="bal_BetMGM")
+    fanatics_bal = st.number_input("Fanatics ($)", min_value=0.0, step=1.0, key="bal_Fanatics")
 
-    total_roll = dk_bal + fd_bal + pp_bal + kalshi_bal + mgm_bal + fanatics_bal
-    st.metric("Total Active Roll", f"${total_roll:,.2f}")
-
-    unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
-    max_single_bet = round(total_roll * 0.05, 2)
-    st.caption(f"5% Max Single-Ticket Cap: **${max_single_bet:.2f}**")
+    st.checkbox(
+        "Auto-sync balances on log/settle",
+        key="auto_sync_bankroll",
+        help="Automatically deducts Pending stakes and credits Win/Push/Void settlements.",
+    )
 
     df_side = get_bet_log()
     pending_risk = (
@@ -633,6 +695,15 @@ with st.sidebar:
         if not df_side.empty
         else 0.0
     )
+    liquid_roll = dk_bal + fd_bal + pp_bal + kalshi_bal + mgm_bal + fanatics_bal
+    total_roll = round(liquid_roll + pending_risk, 2)
+
+    st.metric("Total Active Roll", f"${total_roll:,.2f}", f"Liquid: ${liquid_roll:,.2f}")
+
+    unit_size = st.number_input("Standard Unit ($)", min_value=0.5, value=2.0, step=0.5)
+    max_single_bet = round(total_roll * 0.05, 2)
+    st.caption(f"5% Max Single-Ticket Cap: **${max_single_bet:.2f}**")
+
     st.metric(
         "Pending Risk Exposure",
         f"${pending_risk:,.2f}",
@@ -665,6 +736,12 @@ with tab1:
     st.caption(
         "Score each floor leg individually (PA / PRA / Rush+Rec) | "
         "80% single BE: **-400** | 2x 80%: **-178** | 3x 80%: **-105**"
+    )
+
+    st.text_input(
+        "Automated Roster Watchlist — Flagged / Out / Doubtful / Questionable Players (comma-separated)",
+        placeholder="Paste today's OUT / Q names from Gemini check (e.g., Kawhi Leonard, Tyrese Haliburton)",
+        key="restricted_players_raw",
     )
 
     c1, c2 = st.columns(2)
@@ -708,7 +785,12 @@ with tab1:
         else round(straight_stake * 0.25, 2)
     )
 
-    if not injury_clear:
+    t1_conflicts = find_roster_conflicts(t1_desc)
+    if t1_conflicts:
+        st.error(
+            f"ROSTER CONFLICT: Slip mentions flagged/inactive player(s): **{', '.join(t1_conflicts)}**. Remove before firing."
+        )
+    elif not injury_clear:
         st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
     elif ev_pct < 0:
         st.warning(
@@ -1115,7 +1197,7 @@ with tab3:
 # TAB 4: PROMO & BANKROLL GUARDRAILS
 # ==========================================
 with tab4:
-    st.subheader("Promo Converter & Fractional Kelly Sizer")
+    st.subheader("Promo Converter, Token Eligibility & Fractional Kelly Sizer")
     pc1, pc2 = st.columns(2)
     with pc1:
         st.markdown("##### Fractional Kelly Sizer")
@@ -1147,6 +1229,51 @@ with tab4:
 
         st.metric("Hedge Stake Needed", f"${hedge_stake:.2f}")
         st.metric("Guaranteed Cash Profit", f"${guaranteed_profit:.2f}", f"{conv_rate:.1f}% Conversion")
+
+    st.divider()
+    st.markdown("##### Automated Promo & Boost Eligibility Guardrail")
+    eg1, eg2, eg3, eg4 = st.columns(4)
+    token_kind = eg1.selectbox(
+        "Token Type",
+        ["Profit Boost", "SGP Profit Boost", "Bonus Bet (SNR)", "Bet Reset / No Sweat", "Early Win Token"],
+    )
+    min_req_odds = eg2.number_input("Token Min Odds", value=-200, step=25)
+    min_req_legs = eg3.number_input("Min Legs Required", min_value=1, max_value=10, value=1)
+    max_token_stake = eg4.number_input("Token Max Wager ($)", min_value=1.0, value=10.0, step=5.0)
+
+    eg5, eg6, eg7 = st.columns(3)
+    slip_odds = eg5.number_input("Your Ticket Odds", value=-105, step=5)
+    slip_legs = eg6.number_input("Your Ticket Legs", min_value=1, max_value=20, value=3)
+    slip_stake = eg7.number_input("Your Planned Stake ($)", min_value=0.5, value=5.0, step=0.5)
+
+    def odds_meets_min(actual: int, minimum: int) -> bool:
+        return amer_to_dec(actual) >= amer_to_dec(minimum)
+
+    promo_issues = []
+    if not odds_meets_min(int(slip_odds), int(min_req_odds)):
+        promo_issues.append(
+            f"Ticket odds ({int(slip_odds):+d}) are shorter/heavier than minimum required ({int(min_req_odds):+d})."
+        )
+    if int(slip_legs) < int(min_req_legs):
+        promo_issues.append(
+            f"Ticket has {int(slip_legs)} leg(s), but token requires at least {int(min_req_legs)}."
+        )
+    if float(slip_stake) > float(max_token_stake):
+        promo_issues.append(
+            f"Stake (${slip_stake:.2f}) exceeds token max wager (${max_token_stake:.2f})."
+        )
+    if token_kind == "Bonus Bet (SNR)" and int(slip_odds) < 100:
+        promo_issues.append(
+            "Bonus Bet (Stake Not Returned) on minus odds forfeits face value; target +110 or longer."
+        )
+
+    if promo_issues:
+        for issue in promo_issues:
+            st.warning(f"PROMO GUARDRAIL: {issue}")
+    else:
+        st.success(
+            f"ELIGIBLE: Ticket clears {token_kind} rules (no stacking with other promos)."
+        )
 
     capped_kelly = (
         min(rec_stake, max_single_bet)
@@ -1211,9 +1338,15 @@ with tab5:
 
         submitted = st.form_submit_button("Log Bet")
         if submitted and b_pick.strip():
-            append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
-            st.success("Bet logged to bet_log.csv!")
-            st.rerun()
+            conflicts = find_roster_conflicts(b_pick)
+            if conflicts:
+                st.error(
+                    f"ROSTER BLOCK: '{', '.join(conflicts)}' is on your Restricted/Injury Watchlist."
+                )
+            else:
+                append_bet_record(b_date, b_plat, b_strat, b_pick, b_stake, b_odds, b_close, b_res)
+                st.success("Bet logged to bet_log.csv!")
+                st.rerun()
 
     df_log = get_bet_log()
     if not df_log.empty:
@@ -1251,7 +1384,7 @@ with tab5:
         st.markdown("#### Settle Pending Bets / Edit Ledger Directly")
         st.caption(
             "Update `Result` (Win / Loss / Push / Void) or `Closing_Odds` directly in the table below and click "
-            "**Save Ledger Changes** to recalculate Profit & CLV automatically."
+            "**Save Ledger Changes** to recalculate Profit, CLV, and book balances automatically."
         )
         edited_df = st.data_editor(
             view_df,
@@ -1283,6 +1416,17 @@ with tab5:
                     res_val = str(row["Result"])
                     prof_val, clv_val = compute_profit_and_clv(st_val, od_val, cl_val, res_val)
                     if idx in merged_df.index:
+                        prev_res = str(merged_df.at[idx, "Result"])
+                        prev_plat = str(merged_df.at[idx, "Platform"])
+                        prev_stake = float(merged_df.at[idx, "Stake"])
+
+                        # Auto-settle book cash delta when transitioning out of Pending
+                        if prev_res == "Pending" and res_val != "Pending":
+                            if res_val == "Win":
+                                apply_bankroll_delta(prev_plat, prev_stake + prof_val)
+                            elif res_val in ("Push", "Void"):
+                                apply_bankroll_delta(prev_plat, prev_stake)
+
                         merged_df.at[idx, "Date"] = str(row["Date"])
                         merged_df.at[idx, "Platform"] = str(row["Platform"])
                         merged_df.at[idx, "Strategy"] = str(row["Strategy"])
