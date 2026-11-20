@@ -509,7 +509,7 @@ with tab1:
     m3.metric("Estimated EV", f"{ev_pct:+.1f}%")
 
     straight_stake = min(unit_size, max_single_bet) if max_single_bet > 0 else unit_size
-    kicker_stake = min(round(unit_size * 0.25, 2), max_single_bet) if max_single_bet > 0 else round(unit_size * 0.25, 2)
+    kicker_stake = min(round(straight_stake * 0.25, 2), max_single_bet) if max_single_bet > 0 else round(straight_stake * 0.25, 2)
 
     if not injury_clear:
         st.error("GATE LOCKED: Verify official injury reports and spread/blowout risk before firing.")
@@ -759,7 +759,7 @@ with tab2:
     r4.metric("PrizePicks Edge", f"{(fair_o - pp_be)*100:+.2f}%", "PLAY" if fair_o > pp_be else "PASS")
 
     if width_c > max_width:
-        st.warning(f"WIDTH WARNING: {width_c:.0f}c exceeds your {max_width}c confidence cap. Book is guessing—size down or pass.")
+        st.warning(f"WIDTH WARNING: {width_c:.0f}c exceeds your {max_width}c confidence cap. Book is guessing — size down or pass.")
 
     render_inline_bet_logger(
         key_prefix="tab2",
@@ -959,31 +959,50 @@ with tab5:
         edited_df = st.data_editor(
             view_df,
             width="stretch",
-            num_rows="dynamic",
+            num_rows="fixed",
             column_config={
+                "Date": st.column_config.TextColumn("Date"),
                 "Platform": st.column_config.SelectboxColumn("Platform", options=PLATFORMS),
                 "Strategy": st.column_config.SelectboxColumn("Strategy", options=STRATEGIES),
+                "Pick": st.column_config.TextColumn("Pick"),
+                "Stake": st.column_config.NumberColumn("Stake", min_value=0.25, step=0.25, format="$%.2f"),
+                "Odds": st.column_config.NumberColumn("Odds", step=5),
+                "Closing_Odds": st.column_config.NumberColumn("Closing_Odds", step=5),
                 "Result": st.column_config.SelectboxColumn("Result", options=["Pending", "Win", "Loss", "Void"]),
+                "Profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
+                "CLV_Pct": st.column_config.NumberColumn("CLV_Pct", format="%.2f%%"),
             },
             key="master_log_editor",
         )
         if st.button("Save Ledger Changes"):
+            merged_df = df_log.copy()
             for idx, row in edited_df.iterrows():
                 try:
                     st_val = float(row["Stake"])
-                    od_val = int(row["Odds"])
-                    cl_val = int(row["Closing_Odds"])
+                    od_val = int(round(float(row["Odds"])))
+                    cl_val = int(round(float(row["Closing_Odds"])))
                     res_val = str(row["Result"])
                     if res_val == "Win":
-                        edited_df.at[idx, "Profit"] = round(st_val * (amer_to_dec(od_val) - 1.0), 2)
+                        prof_val = round(st_val * (amer_to_dec(od_val) - 1.0), 2)
                     elif res_val == "Loss":
-                        edited_df.at[idx, "Profit"] = round(-st_val, 2)
+                        prof_val = round(-st_val, 2)
                     else:
-                        edited_df.at[idx, "Profit"] = 0.0
-                    edited_df.at[idx, "CLV_Pct"] = round((amer_to_prob(cl_val) - amer_to_prob(od_val)) * 100.0, 2)
+                        prof_val = 0.0
+                    clv_val = round((amer_to_prob(cl_val) - amer_to_prob(od_val)) * 100.0, 2)
+                    if idx in merged_df.index:
+                        merged_df.at[idx, "Date"] = str(row["Date"])
+                        merged_df.at[idx, "Platform"] = str(row["Platform"])
+                        merged_df.at[idx, "Strategy"] = str(row["Strategy"])
+                        merged_df.at[idx, "Pick"] = str(row["Pick"])
+                        merged_df.at[idx, "Stake"] = round(st_val, 2)
+                        merged_df.at[idx, "Odds"] = od_val
+                        merged_df.at[idx, "Closing_Odds"] = cl_val
+                        merged_df.at[idx, "Result"] = res_val
+                        merged_df.at[idx, "Profit"] = prof_val
+                        merged_df.at[idx, "CLV_Pct"] = clv_val
                 except Exception:
                     pass
-            save_bet_log(edited_df)
+            save_bet_log(merged_df)
             st.success("Ledger updated and saved to bet_log.csv!")
             st.rerun()
 
