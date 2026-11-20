@@ -2,3 +2,7 @@
 .streamlit/secrets.toml
 __pycache__/
 *.pyc
+
+.agents/
+markets_cache_*.json
+bet_log.csv
