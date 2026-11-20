@@ -88,9 +88,10 @@ with t3:
     if st.button("Test OddsPapi"):
         if not api_key: st.error("Set ODDSPAPI_API_KEY in Secrets or .env")
         else:
-            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "sport": "basketball_nba"}, timeout=12)
+            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "tournamentId": 132}, timeout=12)
             st.write(f"Status: {r.status_code}")
 
 with t4:
     if LOG_PATH.exists(): st.dataframe(pd.read_csv(LOG_PATH), use_container_width=True, hide_index=True)
     else: st.info("No bets logged yet.")
+
