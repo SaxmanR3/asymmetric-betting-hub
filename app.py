@@ -1,5 +1,5 @@
 ﻿import json, os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd, requests, streamlit as st
 from dotenv import load_dotenv
@@ -38,11 +38,6 @@ def imp_prob(odds: float) -> float:
     if odds == 0: return 0.0
     return 100.0 / (odds + 100.0) if odds > 0 else abs(odds) / (abs(odds) + 100.0)
 
-def decimal_to_american(dec: float) -> int:
-    if dec <= 1.0: return -100
-    if dec >= 2.0: return int(round((dec - 1.0) * 100))
-    return int(round(-100.0 / (dec - 1.0)))
-
 def payout_delta(stake: float, odds: float, result: str) -> float:
     dec = (1.0 + odds / 100.0) if odds > 0 else (1.0 + 100.0 / abs(odds)) if odds < 0 else 1.0
     if result == "WIN": return round(stake * (dec - 1.0), 2)
@@ -57,19 +52,32 @@ def kelly_stake(p: float, odds: float, bankroll: float, frac: float, cap: float)
     if edge <= 0: return 0.0
     return round(min(bankroll * edge * frac, cap, bankroll), 2)
 
+def pick_team(f, keys):
+    for k in keys:
+        v = f.get(k)
+        if isinstance(v, dict): v = v.get("name") or v.get("title")
+        if isinstance(v, str) and v.strip(): return v.strip()
+    return None
+
 def parse_fixtures(payload):
     items = payload if isinstance(payload, list) else payload.get("fixtures") or payload.get("data") or payload.get("items") or []
-    rows = []
-    for idx, f in enumerate(items[:25]):
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    upcoming = []
+    all_parsed = []
+    for idx, f in enumerate(items):
         if not isinstance(f, dict): continue
         fid = f.get("fixtureId") or f.get("id") or f"game_{idx+1}"
-        home = f.get("homeTeamName") or f.get("home") or (f.get("homeTeam", {}) or {}).get("name") or "Home"
-        away = f.get("awayTeamName") or f.get("away") or (f.get("awayTeam", {}) or {}).get("name") or "Away"
-        start = f.get("startTime") or f.get("commenceTime") or f.get("date") or ""
+        away = pick_team(f, ["awayTeamName", "away", "participant2Name", "opponentName"]) or "Away"
+        home = pick_team(f, ["homeTeamName", "home", "participant1Name", "teamName"]) or "Home"
+        start = str(f.get("startTime") or f.get("commenceTime") or f.get("date") or "")
         books = f.get("bookmakers") or f.get("odds") or {}
         b_count = len(books) if isinstance(books, (list, dict)) else 0
-        rows.append({"id": str(fid), "Matchup": f"{away} @ {home}", "Start": str(start)[:16], "Books": b_count})
-    return rows
+        rec = {"id": str(fid), "Matchup": f"{away} @ {home}", "Start": start[:16], "Books": b_count}
+        all_parsed.append(rec)
+        if start[:10] >= now_iso:
+            upcoming.append(rec)
+    chosen = upcoming if upcoming else all_parsed
+    return chosen[:25], len(upcoming), len(all_parsed)
 
 if "br_state" not in st.session_state:
     st.session_state.br_state = load_saved_br()
@@ -81,6 +89,8 @@ if "sizer_app" not in st.session_state:
     st.session_state.sizer_app = "FanDuel"
 if "scan_rows" not in st.session_state:
     st.session_state.scan_rows = []
+if "scan_meta" not in st.session_state:
+    st.session_state.scan_meta = ""
 
 st.title("Asymmetric Betting Hub")
 st.caption("NBA Cup Slate · Nov 20, 2026 · 80% Floor · Layer 3 Ladder · Fractional Kelly")
@@ -142,10 +152,14 @@ with t3:
     if st.button("Test OddsPapi"):
         if not api_key: st.error("Set ODDSPAPI_API_KEY in Secrets or .env")
         else:
-            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "tournamentId": 132}, timeout=12)
+            r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "tournamentId": 132, "upcoming": "true"}, timeout=12)
             st.write(f"Status: {r.status_code}")
             if r.status_code == 200:
-                st.session_state.scan_rows = parse_fixtures(r.json())
+                parsed, up_cnt, tot_cnt = parse_fixtures(r.json())
+                st.session_state.scan_rows = parsed
+                st.session_state.scan_meta = f"Upcoming from today: {up_cnt} | Total returned: {tot_cnt}"
+    if st.session_state.scan_meta:
+        st.caption(st.session_state.scan_meta)
     if st.session_state.scan_rows:
         df_scan = pd.DataFrame(st.session_state.scan_rows)[["Matchup", "Start", "Books"]]
         st.dataframe(df_scan, use_container_width=True, hide_index=True)
