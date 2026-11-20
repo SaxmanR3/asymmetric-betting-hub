@@ -15,26 +15,21 @@ def get_key():
     try:
         if "ODDSPAPI_API_KEY" in st.secrets:
             v = str(st.secrets["ODDSPAPI_API_KEY"]).strip()
-            if v:
-                return v
-    except Exception:
-        pass
+            if v: return v
+    except Exception: pass
     v = os.getenv("ODDSPAPI_API_KEY", "").strip()
     return v or None
 
 def imp_prob(odds: float) -> float:
-    if odds == 0:
-        return 0.0
+    if odds == 0: return 0.0
     return 100.0 / (odds + 100.0) if odds > 0 else abs(odds) / (abs(odds) + 100.0)
 
 def kelly_stake(p: float, odds: float, bankroll: float, frac: float, cap: float) -> float:
     dec = (1.0 + odds / 100.0) if odds > 0 else (1.0 + 100.0 / abs(odds)) if odds < 0 else 1.0
     b = dec - 1.0
-    if b <= 0 or not (0 < p < 1):
-        return 0.0
+    if b <= 0 or not (0 < p < 1): return 0.0
     edge = (b * p - (1.0 - p)) / b
-    if edge <= 0:
-        return 0.0
+    if edge <= 0: return 0.0
     return round(min(bankroll * edge * frac, cap, bankroll), 2)
 
 st.title("Asymmetric Betting Hub")
@@ -74,30 +69,18 @@ with t1:
 
 with t2:
     base_line = st.number_input("Base Line", 0.5, 100.0, 20.0, 0.5)
-    rows = [
-        {
-            "Rung": i,
-            "Alt": f"{round(base_line*m,1)}+",
-            "Est %": f"{88-(i-1)*11:.1f}%",
-            "Stake": kelly_stake((88-(i-1)*11)/100, -240 if i<=2 else -140, bankroll, kelly_f, cap_usd),
-        }
-        for i, m in enumerate([0.75, 0.85, 0.95, 1.0], 1)
-    ]
+    rows = [{"Rung": i, "Alt": f"{round(base_line*m,1)}+", "Est %": f"{88-(i-1)*11:.1f}%", "Stake": kelly_stake((88-(i-1)*11)/100, -240 if i<=2 else -140, bankroll, kelly_f, cap_usd)} for i, m in enumerate([0.75, 0.85, 0.95, 1.0], 1)]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with t3:
     found = [{"File": p.name, "KB": round(p.stat().st_size/1024, 1)} for p in CACHES if p.exists()]
-    if found:
-        st.dataframe(pd.DataFrame(found), use_container_width=True, hide_index=True)
+    if found: st.dataframe(pd.DataFrame(found), use_container_width=True, hide_index=True)
     if st.button("Test OddsPapi"):
-        if not api_key:
-            st.error("Set ODDSPAPI_API_KEY in Secrets or .env")
+        if not api_key: st.error("Set ODDSPAPI_API_KEY in Secrets or .env")
         else:
             r = requests.get("https://api.oddspapi.io/v4/fixtures", params={"apiKey": api_key, "sport": "basketball_nba"}, timeout=12)
             st.write(f"Status: {r.status_code}")
 
 with t4:
-    if LOG_PATH.exists():
-        st.dataframe(pd.read_csv(LOG_PATH), use_container_width=True, hide_index=True)
-    else:
-        st.info("No bets logged yet.")
+    if LOG_PATH.exists(): st.dataframe(pd.read_csv(LOG_PATH), use_container_width=True, hide_index=True)
+    else: st.info("No bets logged yet.")
