@@ -537,16 +537,32 @@ with tab2:
     if "sport_map" not in st.session_state:
         st.session_state["sport_map"] = dict(DEFAULT_SPORTS)
 
+    if "t2_max_width" not in st.session_state:
+        st.session_state["t2_max_width"] = 25
+    if "t2_min_ev" not in st.session_state:
+        st.session_state["t2_min_ev"] = 2.0
+    if "t2_books" not in st.session_state:
+        st.session_state["t2_books"] = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"]
+
     # Preset Filter Chips (0 API Credits)
     pc_a, pc_b, pc_c = st.columns(3)
     if pc_a.button("Preset: Tight Lines (<=15c, >=3% EV)", width="stretch"):
         st.session_state["t2_max_width"] = 15
         st.session_state["t2_min_ev"] = 3.0
+        st.session_state["t2_width_input"] = 15
+        st.session_state["t2_ev_input"] = 3.0
+        st.rerun()
     if pc_b.button("Preset: Standard (<=25c, >=2% EV)", width="stretch"):
         st.session_state["t2_max_width"] = 25
         st.session_state["t2_min_ev"] = 2.0
+        st.session_state["t2_width_input"] = 25
+        st.session_state["t2_ev_input"] = 2.0
+        st.rerun()
     if pc_c.button("Select All 5 My Books", width="stretch"):
-        st.session_state["t2_books"] = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"]
+        all_five = ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"]
+        st.session_state["t2_books"] = all_five
+        st.session_state["t2_books_ms"] = all_five
+        st.rerun()
 
     col_a, col_b, col_c = st.columns(3)
     selected_sport = col_a.selectbox("Sport / League", list(st.session_state["sport_map"].keys()))
@@ -554,21 +570,24 @@ with tab2:
         "Max Market Width (cents)",
         min_value=5,
         max_value=60,
-        value=st.session_state.get("t2_max_width", 25),
+        value=st.session_state["t2_max_width"],
+        key="t2_width_input",
     )
     min_ev = col_c.number_input(
         "Min EV % to Flag",
         min_value=0.0,
         max_value=20.0,
-        value=st.session_state.get("t2_min_ev", 2.0),
+        value=st.session_state["t2_min_ev"],
         step=0.5,
+        key="t2_ev_input",
     )
 
     selected_books = st.multiselect(
         "Target Books to Shop",
         TARGET_SOFT_BOOKS,
-        default=st.session_state.get("t2_books", ["draftkings", "fanduel", "kalshi", "betmgm", "fanatics"]),
+        default=st.session_state["t2_books"],
         format_func=fmt_book,
+        key="t2_books_ms",
     )
 
     b1, b2 = st.columns([2, 1])
@@ -926,10 +945,19 @@ with tab5:
         t3.metric("Avg CLV", f"{avg_clv:+.2f}%")
         t4.metric("Pending Tickets", f"{len(df_log[df_log['Result'] == 'Pending'])}")
 
+        flt1, flt2 = st.columns(2)
+        plat_filter = flt1.selectbox("Filter Ledger by Platform", ["All Platforms"] + PLATFORMS, key="t5_plat_flt")
+        res_filter = flt2.selectbox("Filter Ledger by Result", ["All Results", "Pending", "Win", "Loss", "Void"], key="t5_res_flt")
+        view_df = df_log.copy()
+        if plat_filter != "All Platforms":
+            view_df = view_df[view_df["Platform"] == plat_filter]
+        if res_filter != "All Results":
+            view_df = view_df[view_df["Result"] == res_filter]
+
         st.markdown("#### Settle Pending Bets / Edit Ledger Directly")
         st.caption("Update `Result` (Win / Loss / Void) or `Closing_Odds` directly in the table below and click **Save Ledger Changes** to recalculate Profit & CLV automatically.")
         edited_df = st.data_editor(
-            df_log,
+            view_df,
             width="stretch",
             num_rows="dynamic",
             column_config={
