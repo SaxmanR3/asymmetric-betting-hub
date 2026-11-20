@@ -296,7 +296,7 @@ DEFAULT_SPORTS = {
     "College Football (NCAAF)": {"sportId": 14, "filter": "ncaa", "level": "College"},
     "Pro Basketball (NBA)": {"sportId": 11, "filter": "nba", "level": "Pro"},
     "College Basketball (NCAAB)": {"sportId": 11, "filter": "ncaa", "level": "College"},
-    "Pro Women\x27s Basketball (WNBA)": {"sportId": 11, "filter": "wnba", "level": "Pro"},
+    "Pro Women's Basketball (WNBA)": {"sportId": 11, "filter": "wnba", "level": "Pro"},
     "Pro Hockey (NHL)": {"sportId": 15, "filter": "nhl", "level": "Pro"},
     "Pro Baseball (MLB)": {"sportId": 13, "filter": "mlb", "level": "Pro"},
     "Soccer (MLS / EPL / UCL)": {"sportId": 10, "filter": "", "level": "Pro"},
@@ -480,14 +480,14 @@ with tab2:
             b_odds = st.session_state["last_b_odds"]
             catalog = st.session_state.get("last_catalog", {})
             ev_rows, pp_rows = scan_fixture_ev(b_odds, catalog, selected_books, max_width, min_ev)
-            st.markdown(f"### Results: {st.session_state.get(\x27last_scan_game\x27, \x27\x27)}")
+            st.markdown(f"### Results: {st.session_state.get('last_scan_game', '')}")
             key_books = [b for b in PRIORITY_BOOKS if b in b_odds]
-            st.caption(f"Live sharp/target books in this scan: **{ \x27, \x27.join(fmt_book(b) for b in key_books) }** — Adjust Max Width, Min EV, or Target Books above to re-filter for 0 credits.")
+            st.caption(f"Live sharp/target books in this scan: **{ ', '.join(fmt_book(b) for b in key_books) }** — Adjust Max Width, Min EV, or Target Books above to re-filter for 0 credits.")
             st.markdown(f"#### +EV Soft Book Plays ({len(ev_rows)} found)")
             if ev_rows:
                 st.dataframe(pd.DataFrame(ev_rows), width="stretch")
             else:
-                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {\x27, \x27.join(fmt_book(b) for b in selected_books)}.")
+                st.info(f"No plays met >= {min_ev:.1f}% EV under {max_width}c width on {', '.join(fmt_book(b) for b in selected_books)}.")
             st.markdown(f"#### PrizePicks 5/6-Flex Qualifying Props ({len(pp_rows)} found)")
             if pp_rows:
                 st.dataframe(pd.DataFrame(pp_rows), width="stretch")
@@ -636,3 +636,4 @@ with tab5:
         t2.metric("Overall ROI", f"{roi:+.1f}%")
         t3.metric("Avg CLV", f"{avg_clv:+.2f}%")
         st.dataframe(df_log, width="stretch")
+
