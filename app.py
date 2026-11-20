@@ -1,5 +1,4 @@
-Set-Content -Path "app.py" -Encoding UTF8 -Value @'
-import json, os
+﻿import json, os
 from datetime import datetime
 from pathlib import Path
 import pandas as pd, requests, streamlit as st
@@ -79,8 +78,3 @@ with t3:
 with t4:
     if LOG_PATH.exists(): st.dataframe(pd.read_csv(LOG_PATH), use_container_width=True, hide_index=True)
     else: st.info("No bets logged yet.")
-'@
-python -m py_compile app.py
-git add app.py
-git commit -m "Clean app.py syntax"
-git push
