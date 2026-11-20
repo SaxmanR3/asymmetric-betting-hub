@@ -348,28 +348,43 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: COMBOS & SINGLES (80% FLOOR ENGINE)
+# TAB 1: COMBOS & SINGLES (PER-LEG ENGINE)
 # ==========================================
 with tab1:
-    st.subheader("Combos & Singles Guardrail (PA / PRA / Rush+Rec)")
-    st.caption("80% single breakeven: **-400** | Two 80% legs: **64.0% (-178)** | Three 80% legs: **51.2% (-105)**")
+    st.subheader("Combos & Singles Guardrail (Per-Leg Check)")
+    st.caption("Score each leg individually so one shaky leg doesn't disguise a weak combo.")
 
     c1, c2 = st.columns(2)
     with c1:
-        num_legs = st.radio("Number of Floor Legs", [1, 2, 3], horizontal=True, index=2)
-        est_hit = st.slider("Estimated Hit Rate per Leg (%)", 65, 90, 80) / 100.0
+        num_legs = st.radio("Number of Legs", [1, 2, 3], horizontal=True, index=2)
+        leg_probs = []
+        for idx in range(1, num_legs + 1):
+            p_leg = st.slider(
+                f"Leg {idx} Hit Rate (%)",
+                min_value=50,
+                max_value=95,
+                value=80,
+                key=f"leg_hit_{idx}",
+            ) / 100.0
+            leg_probs.append(p_leg)
+
     with c2:
-        posted_odds = st.number_input("Posted Book Odds (American)", value=-115, step=5)
+        posted_odds = st.number_input("Posted Ticket Odds (American)", value=-115, step=5)
         if st.button("Check Injury Updates"):
             st.info(
-                "Official & live injury boards:\n"
-                "- NBA Official Injury Report: https://official.nba.com/nba-injury-report/\n"
-                "- NFL Official Injury Report: https://www.nfl.com/injuries/\n"
+                "Official & live injury boards:
+"
+                "- NBA Official Injury Report: https://official.nba.com/nba-injury-report/
+"
+                "- NFL Official Injury Report: https://www.nfl.com/injuries/
+"
                 "- College Basketball & Football News: https://www.espn.com/injuries/"
             )
         injury_clear = st.checkbox("All players confirmed ACTIVE (No Q/D/O tags or blowout traps)", value=False)
 
-    comb_prob = est_hit ** num_legs
+    comb_prob = 1.0
+    for p_val in leg_probs:
+        comb_prob *= p_val
     fair_odds = prob_to_amer(comb_prob)
     ev_pct = calc_ev(comb_prob, posted_odds)
 
