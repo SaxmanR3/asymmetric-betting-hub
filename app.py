@@ -74,11 +74,27 @@ def matches_league(fx: dict, league_filter: str) -> bool:
     if not league_filter:
         return True
     tourn = (fx.get("tournamentName") or fx.get("tournamentSlug") or "").lower()
+    sport_name = (fx.get("sportName") or fx.get("sportSlug") or "").lower()
+    blob = f"{tourn} {sport_name}".strip()
     if league_filter == "nba":
         return "nba" in tourn and "wnba" not in tourn
     if league_filter == "wnba":
         return "wnba" in tourn
-    return league_filter in tourn
+    if league_filter == "ncaam":
+        return ("ncaa" in tourn or "college" in tourn) and (
+            "women" not in tourn and "ncaaw" not in tourn and "w-" not in tourn
+        )
+    if league_filter == "ncaaw":
+        return ("ncaa" in tourn or "college" in tourn) and (
+            "women" in tourn or "ncaaw" in tourn or "w-" in tourn
+        )
+    if league_filter == "ncaaf":
+        return ("ncaa" in tourn or "college" in tourn or "fbs" in tourn or "fcs" in tourn or "football" in blob) and (
+            "basketball" not in blob and "baseball" not in blob and "hockey" not in blob
+        )
+    if league_filter == "mls":
+        return "mls" in tourn or "major league soccer" in tourn
+    return league_filter in blob
 
 BOOK_LABELS = {
     "pinnacle": "Pinnacle",
@@ -375,30 +391,46 @@ def scan_fixture_ev(b_odds: dict, catalog: dict, target_books: list, max_width: 
     return ev_rows, pp_rows
 
 SD_MULTIPLIERS = {
-    "Pass Attempts": 0.25,
-    "Completions": 0.28,
-    "Passing Yards": 0.31,
-    "Carries": 0.39,
-    "Receptions": 0.53,
-    "Rush + Rec Yards": 0.50,
-    "Rushing Yards (Overall)": 0.56,
-    "Rushing Yards (<60 YPG)": 0.63,
-    "Rushing Yards (60-80 YPG)": 0.52,
-    "Rushing Yards (80+ YPG)": 0.42,
-    "Receiving Yards (WR)": 0.64,
-    "Receiving Yards (TE)": 0.69,
+    # NFL / Football
+    "NFL: Pass Attempts": 0.25,
+    "NFL: Completions": 0.28,
+    "NFL: Passing Yards": 0.31,
+    "NFL: Carries": 0.39,
+    "NFL: Receptions": 0.53,
+    "NFL: Rush + Rec Yards": 0.50,
+    "NFL: Rushing Yards (Overall)": 0.56,
+    "NFL: Rushing Yards (<60 YPG)": 0.63,
+    "NFL: Rushing Yards (60-80 YPG)": 0.52,
+    "NFL: Rushing Yards (80+ YPG)": 0.42,
+    "NFL: Receiving Yards (WR)": 0.64,
+    "NFL: Receiving Yards (TE)": 0.69,
+    # NBA / Basketball
+    "NBA: Points": 0.34,
+    "NBA: Rebounds": 0.38,
+    "NBA: Assists": 0.45,
+    "NBA: PRA (Pts+Reb+Ast)": 0.27,
+    "NBA: 3-Pointers Made": 0.58,
+    # MLB / Baseball
+    "MLB: Pitcher Strikeouts": 0.36,
+    "MLB: Hits + Runs + RBIs": 0.48,
+    "MLB: Total Bases": 0.68,
+    # NHL / Hockey
+    "NHL: Shots on Goal": 0.44,
+    "NHL: Points (Goals+Assists)": 0.62,
+    # Custom / Manual
+    "Custom / Game-Log Driven": 0.45,
 }
 
 DEFAULT_SPORTS = {
     "NFL": {"sportId": 14, "filter": "nfl"},
-    "NCAAF (College Football)": {"sportId": 14, "filter": "ncaa"},
+    "NCAAF": {"sportId": 14, "filter": "ncaaf"},
     "NBA": {"sportId": 11, "filter": "nba"},
-    "NCAAB (College Basketball)": {"sportId": 11, "filter": "ncaa"},
-    "WNBA": {"sportId": 11, "filter": "wnba"},
-    "NHL": {"sportId": 15, "filter": "nhl"},
+    "MLS": {"sportId": 10, "filter": "mls"},
     "MLB": {"sportId": 13, "filter": "mlb"},
-    "Soccer (MLS / EPL / UCL)": {"sportId": 10, "filter": ""},
-    "Tennis (ATP / WTA)": {"sportId": 12, "filter": ""},
+    "WNBA": {"sportId": 11, "filter": "wnba"},
+    "NCAAM": {"sportId": 11, "filter": "ncaam"},
+    "NCAAW": {"sportId": 11, "filter": "ncaaw"},
+    "Tennis": {"sportId": 12, "filter": ""},
     "Boxing": {"sportId": 21, "filter": ""},
 }
 
